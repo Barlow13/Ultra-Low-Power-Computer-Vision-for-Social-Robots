@@ -1,0 +1,87 @@
+{
+  "model_name": "AdvancedMobileNetV2",
+  "model_size_kb": 783.2421875,
+  "input_shape": [
+    128,
+    128,
+    3
+  ],
+  "classes": [
+    "person",
+    "dog",
+    "cat",
+    "none"
+  ],
+  "thresholds": [
+    0.3413793103448276,
+    0.31724137931034485,
+    0.31724137931034485,
+    0.3655172413793104
+  ],
+  "metrics": {
+    "f1_macro": 0.6833668090358015,
+    "f1_micro": 0.6978015968500492,
+    "f1_weighted": 0.6988406372846255,
+    "precision_macro": 0.6434079277142242,
+    "recall_macro": 0.7291653792853201
+  },
+  "class_metrics": {
+    "person": {
+      "f1": 0.777509068923821,
+      "precision": 0.730266893810335,
+      "recall": 0.8312863606981254,
+      "support": 1547,
+      "threshold": 0.3413793103448276,
+      "avg_confidence": 0.3893837630748749
+    },
+    "dog": {
+      "f1": 0.5548051948051949,
+      "precision": 0.5061611374407583,
+      "recall": 0.6137931034482759,
+      "support": 870,
+      "threshold": 0.31724137931034485,
+      "avg_confidence": 0.27875474095344543
+    },
+    "cat": {
+      "f1": 0.6977509599561162,
+      "precision": 0.6631908237747653,
+      "recall": 0.7361111111111112,
+      "support": 864,
+      "threshold": 0.31724137931034485,
+      "avg_confidence": 0.24042847752571106
+    },
+    "none": {
+      "f1": 0.7034020124580738,
+      "precision": 0.6740128558310376,
+      "recall": 0.7354709418837675,
+      "support": 998,
+      "threshold": 0.3655172413793104,
+      "avg_confidence": 0.2756703495979309
+    }
+  },
+  "config": {
+    "BATCH_SIZE": 16,
+    "FROZEN_EPOCHS": 32,
+    "FINE_TUNE_EPOCHS": 128,
+    "INITIAL_LR": 0.001,
+    "FINE_TUNE_LR": 0.0001,
+    "MIN_LR": 1e-08,
+    "IMG_HEIGHT": 128,
+    "IMG_WIDTH": 128,
+    "DROPOUT_RATE": 0.5,
+    "MOBILENET_ALPHA": 0.35,
+    "MIXUP_ALPHA": 0.2,
+    "AUGMENTATION_STRENGTH": 0.3,
+    "SEED": 42,
+    "NICKNAME": "AdvancedMobileNetV2",
+    "DATASET_ROOT": "../datasets/coco",
+    "EXPORT_DIR": "./export",
+    "CHECKPOINT_DIR": "./checkpoints"
+  },
+  "training_summary": {
+    "stage1_epochs": 32,
+    "stage2_epochs": 44,
+    "total_epochs": 76
+  },
+  "created": "2025-08-03T22:36:48.468802"
+}
