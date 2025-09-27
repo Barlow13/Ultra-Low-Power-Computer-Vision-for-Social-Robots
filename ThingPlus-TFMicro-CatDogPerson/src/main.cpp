@@ -23,7 +23,8 @@
 
 // Project headers - Include the model data
 #include "model_data.h"
-#include "model_metadata.h"
+// NOTE: Removed missing header model_metadata.h. Metadata (class names, thresholds) is
+// embedded below using values from TensorFlow/export/metadata.json.
 
 // TensorFlow Lite includes
 #include "tensorflow/lite/micro/micro_error_reporter.h"
@@ -61,10 +62,13 @@ enum CoreCommand {
     CMD_ERROR = 3
 };
 
+// Number of model output classes (person, dog, cat, none)
+static constexpr int kNumClasses = 4;
+
 // Shared data structure for inference results
 struct InferenceResult {
-    float scores[4];
-    uint8_t predictions[4];
+    float scores[kNumClasses];
+    uint8_t predictions[kNumClasses];
     uint32_t inference_time_ms;
     bool valid;
 };
@@ -89,9 +93,13 @@ static volatile int g_model_input_channels = 3;
 // Results shared between cores
 static volatile InferenceResult g_inference_result __attribute__((aligned(8)));
 
-// Thresholds and class names sourced from generated metadata
-static constexpr float g_improved_thresholds[4] = { 0.55000001f, 0.30000001f, 0.34999999f, 0.25f };
-static constexpr const char* g_class_names[4] = { "person", "dog", "cat", "none" };
+// Thresholds and class names sourced from generated metadata (metadata.json)
+static constexpr float g_improved_thresholds[kNumClasses] = { 0.55000001f, 0.30000001f, 0.34999999f, 0.25f };
+static constexpr const char* g_class_names[kNumClasses] = { "person", "dog", "cat", "none" };
+static_assert(sizeof(g_improved_thresholds)/sizeof(g_improved_thresholds[0]) == kNumClasses,
+              "Threshold count mismatch");
+static_assert(sizeof(g_class_names)/sizeof(g_class_names[0]) == kNumClasses,
+              "Class name count mismatch");
 
 // Forward declarations
 bool setup_hardware();
@@ -126,10 +134,10 @@ void print_inference_results(const InferenceResult* result) {
         return;
     }
     
-    printf("\n=== Detection Results (Time: %lu ms) ===\n", result->inference_time_ms);
+    printf("\n=== Detection Results (Time: %u ms) ===\n", result->inference_time_ms);
     
     bool detected_anything = false;
-    for (int i = 0; i < 4; i++) {
+    for (int i = 0; i < kNumClasses; i++) {
         if (result->predictions[i]) {
             printf("  %s: %.3f (DETECTED)\n", g_class_names[i], result->scores[i]);
             detected_anything = true;
@@ -149,9 +157,10 @@ void print_inference_results(const InferenceResult* result) {
 // Supports uint8, int8, or float output tensors. Applies per-class thresholds.
 static void postprocess_output(const TfLiteTensor* out, InferenceResult* result) {
     if (!out || !result) return;
+
     if (out->type == kTfLiteUInt8) {
         const uint8_t *data = out->data.uint8;
-        for (int i = 0; i < 4; ++i) {
+        for (int i = 0; i < kNumClasses; ++i) {
             float score = data[i] / 255.0f;
             result->scores[i] = score;
             result->predictions[i] = (score > g_improved_thresholds[i]);
@@ -160,7 +169,7 @@ static void postprocess_output(const TfLiteTensor* out, InferenceResult* result)
         const int8_t *data = out->data.int8;
         float scale = out->params.scale;
         int zp = out->params.zero_point;
-        for (int i = 0; i < 4; ++i) {
+        for (int i = 0; i < kNumClasses; ++i) {
             float score = scale * (data[i] - zp);
             if (score < 0.f) score = 0.f; else if (score > 1.f) score = 1.f;
             result->scores[i] = score;
@@ -168,14 +177,14 @@ static void postprocess_output(const TfLiteTensor* out, InferenceResult* result)
         }
     } else if (out->type == kTfLiteFloat32) {
         const float *data = out->data.f;
-        for (int i = 0; i < 4; ++i) {
+        for (int i = 0; i < kNumClasses; ++i) {
             float score = data[i];
             if (score < 0.f) score = 0.f; else if (score > 1.f) score = 1.f;
             result->scores[i] = score;
             result->predictions[i] = (score > g_improved_thresholds[i]);
         }
     } else {
-        for (int i = 0; i < 4; ++i) {
+        for (int i = 0; i < kNumClasses; ++i) {
             result->scores[i] = 0.f;
             result->predictions[i] = 0;
         }
@@ -435,7 +444,7 @@ void core1_entry() {
      g_model_input_channels = input->dims->data[3];
     }
     printf("Core 1: TensorFlow Lite initialized successfully\n");
-    printf("Core 1: Model size: %lu bytes\n", model_data_len);
+    printf("Core 1: Model size: %u bytes\n", model_data_len);
     printf("Core 1: Input tensor type: %d, dims: %d x %d x %d x %d\n",
         input->type, input->dims->data[0], input->dims->data[1],
         input->dims->data[2], input->dims->data[3]);
@@ -483,7 +492,7 @@ void core1_entry() {
                 uint32_t inference_time_ms = absolute_time_diff_us(
                     inference_start, get_absolute_time()) / 1000;
                 
-          printf("Core 1: Inference took %lu ms (input %dx%dx%d)\n", inference_time_ms,
+          printf("Core 1: Inference took %u ms (input %dx%dx%d)\n", inference_time_ms,
               g_model_input_width, g_model_input_height, g_model_input_channels);
                 
                 if (invoke_status != kTfLiteOk) {
@@ -666,7 +675,7 @@ int main() {
         save = spin_lock_blocking(memory_lock);
         InferenceResult result;
         // Manually copy volatile struct members
-        for (int i = 0; i < 4; i++) {
+        for (int i = 0; i < kNumClasses; i++) {
             result.scores[i] = g_inference_result.scores[i];
             result.predictions[i] = g_inference_result.predictions[i];
         }
