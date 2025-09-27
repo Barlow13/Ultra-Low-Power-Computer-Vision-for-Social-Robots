@@ -8761,9 +8761,13 @@ const unsigned char model_data[] = {
  0x03, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x03, 
 };
 
-// Metadata (extern to avoid multiple definition when header included in many TUs)
-extern const int NUM_CLASSES;
-extern const char* const CLASS_NAMES[];
-extern const float CLASS_THRESHOLDS[];
+const int NUM_CLASSES = 4;
+const char* CLASS_NAMES[] = {"person", "dog", "cat", "none"};
+const float CLASS_THRESHOLDS[] = {0.550000f, 0.300000f, 0.350000f, 0.250000f};
 struct Confusion { int TP; int FP; int TN; int FN; };
-extern const struct Confusion CONFUSION_STATS[];
+const struct Confusion CONFUSION_STATS[] = {
+  { 1095, 223, 1914, 452 }, // person
+  { 561, 707, 2107, 309 }, // dog
+  { 630, 337, 2483, 234 }, // cat
+  { 815, 568, 2118, 183 }, // none
+};

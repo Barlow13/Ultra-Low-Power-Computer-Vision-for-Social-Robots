@@ -183,6 +183,7 @@ target_include_directories(PicoRoadDetector PRIVATE
 target_compile_definitions(PicoRoadDetector PRIVATE
   TF_LITE_MCU_DEBUG_LOG=1
   BYTE_ALREADY_DEFINED=1
+  TF_LITE_MICRO_USE_CMSIS_NN=1
 )
 
 # Set compiler options

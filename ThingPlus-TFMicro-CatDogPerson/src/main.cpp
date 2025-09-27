@@ -1,693 +1,499 @@
 /**
- * ThingPlus-TFMicro-CatDogPerson
+ * ThingPlus-TFMicro-CatDogPerson (Main Application)
+ * ---------------------------------------------------------------------------
+ * Dual‑core RP2040 application performing multi‑label classification
+ * (person / dog / cat / none) on frames captured by an Arducam Mega module.
  *
- * This application uses both RP2040 cores to efficiently run TensorFlow Lite
- * machine learning models for object detection:
- * - Core 0: I/O operations (camera, user interface)
- * - Core 1: TensorFlow Lite inference and image processing
+ *  Core0 responsibilities:
+ *    - Hardware & camera init
+ *    - Frame acquisition (JPEG)
+ *    - Shell / logging / scheduling
+ *
+ *  Core1 responsibilities:
+ *    - TensorFlow Lite Micro model init
+ *    - JPEG decode + resize + pre‑processing
+ *    - Running inference & post‑processing
  */
 
-#include "pico/stdlib.h"
-#include "pico/multicore.h"
-#include "pico/util/queue.h"
-#include "hardware/spi.h"
-#include "hardware/gpio.h"
-#include "hardware/sync.h"
-#include "pico/time.h"
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
-#include "picojpeg.h"
-#include "jpeg_decoder.h"
+#include "pico/stdlib.h"
+#include "pico/multicore.h"
+#include "pico/util/queue.h"
+#include "pico/time.h"
+#include "hardware/spi.h"
+#include "hardware/gpio.h"
+#include "hardware/sync.h"
+#include "hardware/clocks.h"
 #include "Arducam/Arducam_Mega.h"
-
-// Project headers - Include the model data
+#include "jpeg_decoder.h" 
+#include "picojpeg.h"
 #include "model_data.h"
-// NOTE: Removed missing header model_metadata.h. Metadata (class names, thresholds) is
-// embedded below using values from TensorFlow/export/metadata.json.
-
-// TensorFlow Lite includes
 #include "tensorflow/lite/micro/micro_error_reporter.h"
 #include "tensorflow/lite/micro/micro_interpreter.h"
-#include "tensorflow/lite/micro/all_ops_resolver.h"
 #include "tensorflow/lite/micro/micro_mutable_op_resolver.h"
 #include "tensorflow/lite/schema/schema_generated.h"
 #include "tensorflow/lite/version.h"
-#include <hardware/clocks.h>
-#include <hardware/i2c.h>
 
-#define SPI_PORT spi0
-#define PIN_SCK 2
-#define PIN_COPI 3
-#define PIN_CIPO 4
-#define PIN_CS 16
-#define DEBUG 1
+// ---------------------------------------------------------------------------
+// Configuration
+// ---------------------------------------------------------------------------
 
-// Model dimensions are defined in CMakeLists.txt and passed via compiler flags
+#ifndef APP_SPI_BAUD
+#define APP_SPI_BAUD        (8 * 1000 * 1000u)   // 8 MHz
+#endif
+#define SPI_PORT            spi0
+#define PIN_SCK             2
+#define PIN_COPI            3
+#define PIN_CIPO            4
+#define PIN_CS              16
 
-Arducam_Mega myCAM(PIN_CS);
+#define APP_DEBUG           1
+#define APP_CAPTURE_JPEG_MODE CAM_IMAGE_MODE_96X96
+#define APP_CAPTURE_PIX_FMT   CAM_IMAGE_PIX_FMT_JPG
 
-// Spinlock for shared memory access
-spin_lock_t *memory_lock;
-#define MEMORY_LOCK_ID 0
+static constexpr size_t kTensorArenaSize = 170 * 1024;
 
-// Queue for inter-core commands
-queue_t core0_to_core1_queue;
-queue_t core1_to_core0_queue;
+// Enable one-shot arena usage measurement (set to 1 temporarily). After you
+// read the printed value, set back to 0 and optionally reduce kTensorArenaSize.
+#ifndef APP_ARENA_MEASURE
+#define APP_ARENA_MEASURE 0
+#endif
 
-// Commands for inter-core communication
-enum CoreCommand {
-    CMD_PROCESS_IMAGE = 1,
-    CMD_INFERENCE_COMPLETE = 2,
-    CMD_ERROR = 3
-};
-
-// Number of model output classes (person, dog, cat, none)
-static constexpr int kNumClasses = 4;
-
-// Shared data structure for inference results
-struct InferenceResult {
-    float scores[kNumClasses];
-    uint8_t predictions[kNumClasses];
-    uint32_t inference_time_ms;
-    bool valid;
-};
-
-// Pre-allocated buffers to reduce memory fragmentation
-// Buffer for camera capture - shared between cores
-constexpr int kTensorArenaSize = 170 * 1024;  // 150KB for tensor arena
-static uint8_t g_capture_buffer[16384] __attribute__((aligned(8)));
-static uint32_t g_capture_size = 0;
-
-// Buffer for image processing - used by core 1 - RGB buffer.
-// Allocate generous maximum (supports up to 128x128x3). Update if deploying larger models.
+// Maximum model input supported by static work buffer (RGB)
 static constexpr int kMaxInputWidth  = 128;
 static constexpr int kMaxInputHeight = 128;
-static uint8_t g_process_buffer[kMaxInputWidth * kMaxInputHeight * 3] __attribute__((aligned(8)));
 
-// Runtime model input dimensions (populated after interpreter initialization on Core 1)
-static volatile int g_model_input_width  = 96;
-static volatile int g_model_input_height = 96;
-static volatile int g_model_input_channels = 3;
+// JPEG capture buffer size
+static constexpr size_t kMaxJpegSize = 16 * 1024;
 
-// Results shared between cores
-static volatile InferenceResult g_inference_result __attribute__((aligned(8)));
+// Inference pacing
+static constexpr uint32_t kLoopDelayMs = 500;  // reduced delay between captures (was 2000)
+// Enable detailed timing (set to 0 to disable quickly)
+#ifndef APP_ENABLE_TIMING
+#define APP_ENABLE_TIMING 1
+#endif
 
-// Thresholds and class names sourced from generated metadata (metadata.json)
-static constexpr float g_improved_thresholds[kNumClasses] = { 0.55000001f, 0.30000001f, 0.34999999f, 0.25f };
-static constexpr const char* g_class_names[kNumClasses] = { "person", "dog", "cat", "none" };
-static_assert(sizeof(g_improved_thresholds)/sizeof(g_improved_thresholds[0]) == kNumClasses,
-              "Threshold count mismatch");
-static_assert(sizeof(g_class_names)/sizeof(g_class_names[0]) == kNumClasses,
-              "Class name count mismatch");
+#if APP_ENABLE_TIMING
+struct TimingStats {
+    uint32_t capture_ms = 0;
+    uint32_t decode_ms = 0;
+    uint32_t resize_ms = 0;
+    uint32_t invoke_ms = 0;
+    uint32_t frames = 0;
+    void accumulate(uint32_t c, uint32_t d, uint32_t r, uint32_t i) {
+        capture_ms += c; decode_ms += d; resize_ms += r; invoke_ms += i; ++frames; }
+    void print_and_reset() {
+        if (frames == 0) return;
+        printf("[TIMING] avg over %lu frames | capture=%lu ms decode=%lu ms resize=%lu ms invoke=%lu ms total=%lu ms\n",
+               (unsigned long)frames,
+               (unsigned long)(capture_ms/frames),
+               (unsigned long)(decode_ms/frames),
+               (unsigned long)(resize_ms/frames),
+               (unsigned long)(invoke_ms/frames),
+               (unsigned long)((capture_ms+decode_ms+resize_ms+invoke_ms)/frames));
+        capture_ms = decode_ms = resize_ms = invoke_ms = frames = 0;
+    }
+};
+static TimingStats g_timing;             // shared summary (core0 collects capture; core1 collects rest)
+static volatile uint32_t g_last_decode_ms = 0;
+static volatile uint32_t g_last_resize_ms = 0;
+#endif
+static constexpr uint32_t kInitTimeoutMs = 10000;
+static constexpr uint32_t kInvokeTimeoutMs = 5000;
 
-// Forward declarations
-bool setup_hardware();
-bool setup_camera();
-bool capture_image_to_buffer(uint8_t *buffer, size_t buffer_size, uint32_t *captured_size);
-void debug_print(const char *msg);
-void print_inference_results(const InferenceResult* result);
-static void postprocess_output(const TfLiteTensor* output, InferenceResult* result); // new helper
+// Class metadata
+static constexpr int   kNumClasses = 4;
+static constexpr float kClassThresholds[kNumClasses] = {0.55f, 0.30f, 0.35f, 0.25f};
+static constexpr const char* kClassNames[kNumClasses] = {"person", "dog", "cat", "none"};
 
-// TensorFlow Lite globals for Core 1
+// ---------------------------------------------------------------------------
+// Data structures & shared state
+// ---------------------------------------------------------------------------
+
+enum CoreCommand : uint32_t {
+    CMD_PROCESS_IMAGE      = 1,
+    CMD_DONE               = 2,
+    CMD_ERROR              = 3,
+};
+
+struct InferenceResult {
+    float    scores[kNumClasses];
+    uint8_t  predictions[kNumClasses];
+    uint32_t inference_time_ms;
+    bool     valid;
+};
+
+// Shared objects
+static queue_t    q_core0_to_core1;
+static queue_t    q_core1_to_core0;
+static spin_lock_t* g_spinlock;
+static volatile InferenceResult g_shared_result{};
+
+// Buffers (cache‑line aligned for safety)
+alignas(8) static uint8_t g_jpeg_buffer[kMaxJpegSize];
+alignas(8) static uint8_t g_rgb_buffer[kMaxInputWidth * kMaxInputHeight * 3];
+static volatile uint32_t g_jpeg_size = 0;
+
+// Model state (core1 only after init)
 namespace {
-    tflite::MicroErrorReporter micro_error_reporter;
-    tflite::ErrorReporter *error_reporter = &micro_error_reporter;
-    const tflite::Model *model = nullptr;
-    tflite::MicroInterpreter *interpreter = nullptr;
-    TfLiteTensor *input = nullptr;
-    TfLiteTensor *output = nullptr;
-    alignas(16) static uint8_t tensor_arena[kTensorArenaSize];
+    tflite::MicroErrorReporter  s_micro_reporter;
+    tflite::ErrorReporter*      s_reporter = &s_micro_reporter;
+    const tflite::Model*        s_model = nullptr;
+    tflite::MicroInterpreter*   s_interpreter = nullptr;
+    TfLiteTensor*               s_input = nullptr;
+    TfLiteTensor*               s_output = nullptr;
+    alignas(16) static uint8_t  s_tensor_arena[kTensorArenaSize];
 }
 
-// Helper function for debug output
-void debug_print(const char *msg) {
-#if DEBUG
+// Dynamic (post‑init) model input shape
+static volatile int g_input_w = 96;
+static volatile int g_input_h = 96;
+static volatile int g_input_c = 3;
+
+// Camera instance
+static Arducam_Mega g_camera(PIN_CS);
+
+// ---------------------------------------------------------------------------
+// Utility helpers
+// ---------------------------------------------------------------------------
+
+static inline void dbg(const char* msg) {
+#if APP_DEBUG
     printf("%s\n", msg);
 #endif
 }
 
-// Function to print inference results
-void print_inference_results(const InferenceResult* result) {
-    if (!result->valid) {
-        printf("No valid results\n");
-        return;
+static void print_result(const InferenceResult& r) {
+    if (!r.valid) { printf("No result available\n"); return; }
+    printf("\n--- Inference (%lu ms) ---\n", (unsigned long)r.inference_time_ms);
+    bool any = false;
+    for (int i = 0; i < kNumClasses; ++i) {
+        bool det = r.predictions[i] != 0;
+        printf("  %s: %.3f%s\n", kClassNames[i], r.scores[i], det ? " *" : "");
+        any |= det;
     }
-    
-    printf("\n=== Detection Results (Time: %u ms) ===\n", result->inference_time_ms);
-    
-    bool detected_anything = false;
-    for (int i = 0; i < kNumClasses; i++) {
-        if (result->predictions[i]) {
-            printf("  %s: %.3f (DETECTED)\n", g_class_names[i], result->scores[i]);
-            detected_anything = true;
-        } else {
-            printf("  %s: %.3f\n", g_class_names[i], result->scores[i]);
-        }
-    }
-    
-    if (!detected_anything) {
-        printf("  No objects detected above threshold\n");
-    }
-    
-    printf("==========================================\n\n");
+    if (!any) printf("  (no class exceeded threshold)\n");
+    printf("---------------------------\n");
 }
 
-// Post-process model output into scores & binary decisions (multi-label)
-// Supports uint8, int8, or float output tensors. Applies per-class thresholds.
-static void postprocess_output(const TfLiteTensor* out, InferenceResult* result) {
-    if (!out || !result) return;
-
-    if (out->type == kTfLiteUInt8) {
-        const uint8_t *data = out->data.uint8;
-        for (int i = 0; i < kNumClasses; ++i) {
-            float score = data[i] / 255.0f;
-            result->scores[i] = score;
-            result->predictions[i] = (score > g_improved_thresholds[i]);
+static void postprocess_output(const TfLiteTensor* out, InferenceResult* res) {
+    if (!out || !res) return;
+    res->valid = false;
+    switch (out->type) {
+        case kTfLiteUInt8: {
+            const uint8_t* d = out->data.uint8;
+            for (int i = 0; i < kNumClasses; ++i) {
+                float p = d[i] / 255.f;
+                res->scores[i] = p;
+                res->predictions[i] = p > kClassThresholds[i];
+            }
+            break;
         }
-    } else if (out->type == kTfLiteInt8) {
-        const int8_t *data = out->data.int8;
-        float scale = out->params.scale;
-        int zp = out->params.zero_point;
-        for (int i = 0; i < kNumClasses; ++i) {
-            float score = scale * (data[i] - zp);
-            if (score < 0.f) score = 0.f; else if (score > 1.f) score = 1.f;
-            result->scores[i] = score;
-            result->predictions[i] = (score > g_improved_thresholds[i]);
+        case kTfLiteInt8: {
+            const int8_t* d = out->data.int8;
+            float s = out->params.scale; int zp = out->params.zero_point;
+            for (int i = 0; i < kNumClasses; ++i) {
+                float p = s * (d[i] - zp);
+                if (p < 0.f) p = 0.f; else if (p > 1.f) p = 1.f;
+                res->scores[i] = p;
+                res->predictions[i] = p > kClassThresholds[i];
+            }
+            break;
         }
-    } else if (out->type == kTfLiteFloat32) {
-        const float *data = out->data.f;
-        for (int i = 0; i < kNumClasses; ++i) {
-            float score = data[i];
-            if (score < 0.f) score = 0.f; else if (score > 1.f) score = 1.f;
-            result->scores[i] = score;
-            result->predictions[i] = (score > g_improved_thresholds[i]);
+        case kTfLiteFloat32: {
+            const float* d = out->data.f;
+            for (int i = 0; i < kNumClasses; ++i) {
+                float p = d[i];
+                if (p < 0.f) p = 0.f; else if (p > 1.f) p = 1.f;
+                res->scores[i] = p;
+                res->predictions[i] = p > kClassThresholds[i];
+            }
+            break;
         }
-    } else {
-        for (int i = 0; i < kNumClasses; ++i) {
-            result->scores[i] = 0.f;
-            result->predictions[i] = 0;
-        }
+        default:
+            for (int i = 0; i < kNumClasses; ++i) { res->scores[i] = 0.f; res->predictions[i] = 0; }
+            break;
     }
-    result->valid = true;
+    res->valid = true;
 }
 
-// Initialize hardware components
-bool setup_hardware() {
-    // Initialize stdio
+static void print_free_ram() {
+    extern char __StackLimit, __bss_end__;
+    printf("Free RAM (approx): %d bytes\n", (int)(&__StackLimit - &__bss_end__));
+}
+
+// ---------------------------------------------------------------------------
+// Hardware & camera setup (Core0)
+// ---------------------------------------------------------------------------
+
+static bool init_hardware() {
     stdio_init_all();
-    sleep_ms(1000); // Give USB time to initialize
-
-    // Set CPU clock to maximum
+    sleep_ms(600); // allow USB CDC to enumerate
     set_sys_clock_khz(133000, true);
+    dbg("[HW] Clock set to 133 MHz");
 
-    debug_print("Initializing hardware...");
-
-    // Initialize SPI for camera communication
-    spi_init(SPI_PORT, 8000000); // 8 MHz SPI clock
-    gpio_set_function(PIN_SCK, GPIO_FUNC_SPI);
+    spi_init(SPI_PORT, APP_SPI_BAUD);
+    gpio_set_function(PIN_SCK,  GPIO_FUNC_SPI);
     gpio_set_function(PIN_COPI, GPIO_FUNC_SPI);
     gpio_set_function(PIN_CIPO, GPIO_FUNC_SPI);
-
-    // Initialize CS pin
     gpio_init(PIN_CS);
     gpio_set_dir(PIN_CS, GPIO_OUT);
     gpio_put(PIN_CS, 1);
-    
-    // Initialize spinlock for memory protection
-    memory_lock = spin_lock_init(MEMORY_LOCK_ID);
-    
-    // Initialize queues for inter-core communication
-    queue_init(&core0_to_core1_queue, sizeof(uint32_t), 4);
-    queue_init(&core1_to_core0_queue, sizeof(uint32_t), 4);
-    
-    debug_print("Hardware initialized");
+
+    g_spinlock = spin_lock_init(0);
+    queue_init(&q_core0_to_core1, sizeof(uint32_t), 4);
+    queue_init(&q_core1_to_core0, sizeof(uint32_t), 4);
+    dbg("[HW] Queues + spinlock ready");
     return true;
 }
 
-bool setup_camera() {
-    debug_print("Setting up camera...");
-
-    myCAM.begin();
-    debug_print("Camera initialized");
-    
-    // Enable all auto settings
-    myCAM.setRotation(CAM_ROTATION_180);
-    debug_print("Camera rotation set to 180 degrees");
-    myCAM.setAutoFocus(1);
-    debug_print("Camera autofocus enabled");
-    myCAM.setAutoExposure(1);
-    debug_print("Camera auto exposure enabled");
-    myCAM.setAutoWhiteBalance(1);
-    debug_print("Camera auto white balance enabled");
-    myCAM.setAutoISOSensitive(1);
-    debug_print("Camera auto ISO enabled");
-
-    debug_print("Camera setup complete");
+static bool init_camera() {
+    dbg("[CAM] Initializing...");
+    g_camera.begin();
+    g_camera.setRotation(CAM_ROTATION_180);
+    g_camera.setAutoFocus(1);
+    g_camera.setAutoExposure(1);
+    g_camera.setAutoWhiteBalance(1);
+    g_camera.setAutoISOSensitive(1);
+    dbg("[CAM] Ready");
     return true;
 }
 
-// Process image for inference - runs on Core 1
-bool process_image_for_inference(const uint8_t *raw_buffer, uint32_t raw_size, uint8_t *output_buffer,
-                                 int target_w, int target_h) {
-    // Decode JPEG to RGB at the model's resolution
-    uint32_t decoded_width, decoded_height;
-    
-    // First decode to RGB
-    if (!jpeg_decode_to_rgb(raw_buffer, raw_size, output_buffer, &decoded_width, &decoded_height)) {
-        printf("Core 1: Error - JPEG decoding failed\n");
-        return false;
+// Capture JPEG into shared buffer (Core0)
+static bool capture_jpeg(uint32_t* elapsed_ms_out) {
+#if APP_ENABLE_TIMING
+    absolute_time_t t0 = get_absolute_time();
+#endif
+    CamStatus st = g_camera.takePicture(APP_CAPTURE_JPEG_MODE, APP_CAPTURE_PIX_FMT);
+    if (st != CAM_ERR_SUCCESS) { printf("[CAM] takePicture failed (%d)\n", st); return false; }
+    uint32_t len = g_camera.getTotalLength();
+    if (len == 0 || len > kMaxJpegSize) { printf("[CAM] Bad JPEG size %lu\n", len); return false; }
+    uint32_t read = 0;
+    while (read < len) {
+        uint8_t chunk = 128; if (len - read < chunk) chunk = len - read; if (chunk > 255) chunk = 255; // safety
+        read += g_camera.readBuff(g_jpeg_buffer + read, chunk);
     }
-    
-    printf("Core 1: Decoded JPEG %lux%lu to RGB\n", decoded_width, decoded_height);
-    
-    // If the decoded size doesn't match model input, we need to resize
-    if (decoded_width != (uint32_t)target_w || decoded_height != (uint32_t)target_h) {
-        printf("Core 1: Warning - Image size mismatch. Decoded: %lux%lu, Expected: %dx%d\n",
-               decoded_width, decoded_height, target_w, target_h);
-
-        if (target_w > kMaxInputWidth || target_h > kMaxInputHeight) {
-            printf("Core 1: ERROR - target dims exceed buffer (%dx%d vs max %dx%d)\n",
-                   target_w, target_h, kMaxInputWidth, kMaxInputHeight);
-            return false;
-        }
-
-        // Simple nearest neighbor resize using stack allocation for temp buffer
-        uint8_t *temp_buffer = (uint8_t *)alloca((size_t)target_w * (size_t)target_h * 3);
-        for (int y = 0; y < target_h; y++) {
-            for (int x = 0; x < target_w; x++) {
-                int src_x = (x * (int)decoded_width) / target_w;
-                int src_y = (y * (int)decoded_height) / target_h;
-                if (src_x >= (int)decoded_width)  src_x = decoded_width - 1;
-                if (src_y >= (int)decoded_height) src_y = decoded_height - 1;
-                int src_idx = (src_y * decoded_width + src_x) * 3;
-                int dst_idx = (y * target_w + x) * 3;
-                temp_buffer[dst_idx + 0] = output_buffer[src_idx + 0];
-                temp_buffer[dst_idx + 1] = output_buffer[src_idx + 1];
-                temp_buffer[dst_idx + 2] = output_buffer[src_idx + 2];
-            }
-        }
-        memcpy(output_buffer, temp_buffer, (size_t)target_w * (size_t)target_h * 3);
-    }
-    
+    g_jpeg_size = len;
+    printf("[CAM] Captured %lu bytes\n", (unsigned long)len);
+#if APP_ENABLE_TIMING
+    if (elapsed_ms_out) *elapsed_ms_out = absolute_time_diff_us(t0, get_absolute_time())/1000;
+#endif
     return true;
 }
 
-// Fill TFLite input tensor with preprocessed image data
-bool fill_input_tensor(const uint8_t *image_data) {
-    if (!input) {
-        printf("Error: Input tensor not initialized\n");
-        return false;
-    }
+// ---------------------------------------------------------------------------
+// Image processing + input tensor population (Core1)
+// ---------------------------------------------------------------------------
 
-    int height = input->dims->data[1];
-    int width  = input->dims->data[2];
-    int channels = input->dims->data[3];
-    if (channels != 3) {
-        printf("Error: Unsupported channel count %d (expected 3)\n", channels);
-        return false;
+static bool decode_and_resize_to_model(uint8_t* rgb_out, int target_w, int target_h) {
+    uint32_t dec_w = 0, dec_h = 0;
+#if APP_ENABLE_TIMING
+    absolute_time_t t_dec0 = get_absolute_time();
+#endif
+    if (!jpeg_decode_to_rgb(g_jpeg_buffer, g_jpeg_size, rgb_out, &dec_w, &dec_h)) {
+        printf("[ML] JPEG decode failed\n"); return false; }
+#if APP_ENABLE_TIMING
+    g_last_decode_ms = absolute_time_diff_us(t_dec0, get_absolute_time())/1000;
+#endif
+    if ((int)dec_w == target_w && (int)dec_h == target_h) return true;
+    if (target_w > kMaxInputWidth || target_h > kMaxInputHeight) {
+        printf("[ML] Target dims exceed buffer (%dx%d)\n", target_w, target_h); return false; }
+    // In-place nearest-neighbour downscale WITHOUT extra large buffers.
+    // Safe because for dec_w>target_w and dec_h>target_h each source index >= dest index
+    // (due to sx>=x and sy>=y with integer floor after scaling). We iterate forward.
+    const int src_w = (int)dec_w;
+    const int src_h = (int)dec_h;
+#if APP_ENABLE_TIMING
+    absolute_time_t t_res0 = get_absolute_time();
+#endif
+    for (int y = 0; y < target_h; ++y) {
+        int sy = y * src_h / target_h; if (sy >= src_h) sy = src_h - 1;
+        for (int x = 0; x < target_w; ++x) {
+            int sx = x * src_w / target_w; if (sx >= src_w) sx = src_w - 1;
+            int sidx = (sy * src_w + sx) * 3;
+            int didx = (y * target_w + x) * 3;
+            rgb_out[didx+0] = rgb_out[sidx+0];
+            rgb_out[didx+1] = rgb_out[sidx+1];
+            rgb_out[didx+2] = rgb_out[sidx+2];
+        }
     }
-    g_model_input_width = width;
-    g_model_input_height = height;
-    g_model_input_channels = channels;
+#if APP_ENABLE_TIMING
+    g_last_resize_ms = absolute_time_diff_us(t_res0, get_absolute_time())/1000;
+#endif
+    return true;
+}
 
-    // The model expects inputs in specific format based on tensor type
-    if (input->type == kTfLiteFloat32) {
-        float *input_data = input->data.f;
-        for (int y = 0; y < height; y++) {
-            for (int x = 0; x < width; x++) {
-                int src_idx = (y * width + x) * 3;
-                int dst_idx = (y * width + x) * 3;
-                for (int c = 0; c < 3; c++) {
-                    input_data[dst_idx + c] = image_data[src_idx + c] / 255.0f;
-                }
-            }
+static bool populate_input(const uint8_t* rgb) {
+    if (!s_input) return false;
+    const int h = s_input->dims->data[1];
+    const int w = s_input->dims->data[2];
+    const int c = s_input->dims->data[3];
+    if (c != 3) { printf("[ML] Unsupported channel count %d\n", c); return false; }
+    g_input_h = h; g_input_w = w; g_input_c = c;
+    switch (s_input->type) {
+        case kTfLiteFloat32: {
+            float* dst = s_input->data.f;
+            for (int i = 0; i < h * w * c; ++i) dst[i] = rgb[i] / 255.f;
+            break;
         }
-    } else if (input->type == kTfLiteInt8) {
-        int8_t *input_data = input->data.int8;
-        // Int8 tensors usually have specific quantization parameters
-        float scale = input->params.scale;
-        int zero_point = input->params.zero_point;
-        
-        for (int y = 0; y < height; y++) {
-            for (int x = 0; x < width; x++) {
-                int src_idx = (y * width + x) * 3;
-                int dst_idx = (y * width + x) * 3;
-                for (int c = 0; c < 3; c++) {
-                    // Convert to float and then quantize to int8
-                    float pixel_value = image_data[src_idx + c] / 255.0f;
-                    input_data[dst_idx + c] = (int8_t)((pixel_value / scale) + zero_point);
-                }
-            }
+        case kTfLiteInt8: {
+            int8_t* dst = s_input->data.int8; float sc = s_input->params.scale; int zp = s_input->params.zero_point;
+            if (sc == 0) { printf("[ML] Invalid int8 scale=0\n"); return false; }
+            for (int i = 0; i < h * w * c; ++i) {
+                float v = rgb[i] / 255.f; int32_t q = (int32_t)(v / sc) + zp; if (q < -128) q = -128; if (q > 127) q = 127; dst[i] = (int8_t)q; }
+            break;
         }
-    } else if (input->type == kTfLiteUInt8) {
-        uint8_t *input_data = input->data.uint8;
-        // UInt8 tensors might have specific quantization parameters
-        float scale = input->params.scale;
-        int zero_point = input->params.zero_point;
-        
-        if (scale == 0) {
-            // No quantization, just copy the data
-            for (int y = 0; y < height; y++) {
-                for (int x = 0; x < width; x++) {
-                    int src_idx = (y * width + x) * 3;
-                    int dst_idx = (y * width + x) * 3;
-                    for (int c = 0; c < 3; c++) {
-                        input_data[dst_idx + c] = image_data[src_idx + c];
-                    }
-                }
+        case kTfLiteUInt8: {
+            uint8_t* dst = s_input->data.uint8; float sc = s_input->params.scale; int zp = s_input->params.zero_point;
+            if (sc == 0) { memcpy(dst, rgb, h * w * c); }
+            else {
+                for (int i = 0; i < h * w * c; ++i) {
+                    float v = rgb[i] / 255.f; int32_t q = (int32_t)(v / sc) + zp; if (q < 0) q = 0; if (q > 255) q = 255; dst[i] = (uint8_t)q; }
             }
-        } else {
-            // Apply quantization
-            for (int y = 0; y < height; y++) {
-                for (int x = 0; x < width; x++) {
-                    int src_idx = (y * width + x) * 3;
-                    int dst_idx = (y * width + x) * 3;
-                    for (int c = 0; c < 3; c++) {
-                        float pixel_value = image_data[src_idx + c] / 255.0f;
-                        input_data[dst_idx + c] = (uint8_t)((pixel_value / scale) + zero_point);
-                    }
-                }
-            }
+            break;
         }
-    } else {
-        printf("Error: Unsupported input tensor type: %d\n", input->type);
-        return false;
+        default: printf("[ML] Unsupported input type %d\n", s_input->type); return false;
     }
     return true;
 }
 
-// Core 1 entry function - handles all ML inference
-void core1_entry() {
-    printf("Core 1: Starting TensorFlow Lite initialization...\n");
-    
-    // Basic sanity check: model_data must not be null & length plausible.
-    if (model_data_len == 0 || model_data == nullptr) {
-        printf("Core 1: ERROR - model data not present\n");
-        uint32_t error_cmd = CMD_ERROR;
-        queue_try_add(&core1_to_core0_queue, &error_cmd);
-        return;
+// ---------------------------------------------------------------------------
+// Core1 entry (ML pipeline)
+// ---------------------------------------------------------------------------
+static void core1_entry() {
+    printf("[ML] Core1 starting...\n");
+    if (model_data_len == 0 || model_data == nullptr) { printf("[ML] No model data\n"); uint32_t e = CMD_ERROR; queue_try_add(&q_core1_to_core0, &e); return; }
+    s_model = tflite::GetModel(model_data);
+    if (!s_model) { printf("[ML] GetModel failed\n"); uint32_t e = CMD_ERROR; queue_try_add(&q_core1_to_core0, &e); return; }
+
+    static tflite::MicroMutableOpResolver<16> resolver; // add only what we need
+    resolver.AddConv2D(); resolver.AddDepthwiseConv2D(); resolver.AddFullyConnected();
+    resolver.AddReshape(); resolver.AddSoftmax(); resolver.AddAdd(); resolver.AddMul();
+    resolver.AddAveragePool2D(); resolver.AddMaxPool2D(); resolver.AddMean();
+    resolver.AddQuantize(); resolver.AddDequantize(); resolver.AddPad(); resolver.AddConcatenation();
+    resolver.AddRelu6(); resolver.AddLogistic();
+
+    // IMPORTANT: For arena usage measurement we must pattern fill the arena
+    // BEFORE constructing the MicroInterpreter. Its constructor places internal
+    // allocator/graph planner objects inside the arena. Previously we filled
+    // after construction which overwrote those objects and caused AllocateTensors()
+    // to hang, leading to the core0 init timeout you observed.
+#if APP_ARENA_MEASURE
+    memset((void*)s_tensor_arena, 0xCD, kTensorArenaSize); // fill with canary pattern
+#endif
+    static tflite::MicroInterpreter static_interpreter(s_model, resolver, s_tensor_arena, kTensorArenaSize, s_reporter);
+    s_interpreter = &static_interpreter;
+    if (s_interpreter->AllocateTensors() != kTfLiteOk) { printf("[ML] AllocateTensors failed\n"); uint32_t e = CMD_ERROR; queue_try_add(&q_core1_to_core0, &e); return; }
+#if APP_ARENA_MEASURE
+    // Scan from end backward for first non-pattern byte.
+    int used = 0;
+    for (int i = (int)kTensorArenaSize - 1; i >= 0; --i) {
+        if (s_tensor_arena[i] != (uint8_t)0xCD) { used = i + 1; break; }
     }
-    
-    // Use the model data from the header file
-    model = tflite::GetModel(model_data);
-    if (!model) {
-        printf("Core 1: ERROR - Failed to get TFLite model\n");
-        uint32_t error_cmd = CMD_ERROR;
-        queue_try_add(&core1_to_core0_queue, &error_cmd);
-        return;
-    }
-    
-    // Create a resolver with the operations needed for the model
-    static tflite::MicroMutableOpResolver<16> resolver;
-    
-    // Core operations for MobileNet models
-    resolver.AddConv2D();
-    resolver.AddDepthwiseConv2D();
-    resolver.AddFullyConnected();
-    resolver.AddReshape();
-    resolver.AddSoftmax();
-    resolver.AddAdd();
-    resolver.AddMul();
-    resolver.AddAveragePool2D();
-    resolver.AddMaxPool2D();
-    resolver.AddMean();
-    resolver.AddQuantize();
-    resolver.AddDequantize();
-    resolver.AddPad();
-    resolver.AddConcatenation();
-    resolver.AddRelu6();
-    resolver.AddLogistic();
-    
-    // Create interpreter
-    static tflite::MicroInterpreter static_interpreter(
-        model, resolver, tensor_arena, kTensorArenaSize, error_reporter);
-    interpreter = &static_interpreter;
-    
-    // Allocate tensors
-    TfLiteStatus allocate_status = interpreter->AllocateTensors();
-    if (allocate_status != kTfLiteOk) {
-        printf("Core 1: ERROR - Failed to allocate tensors: %d\n", allocate_status);
-        uint32_t error_cmd = CMD_ERROR;
-        queue_try_add(&core1_to_core0_queue, &error_cmd);
-        return;
-    }
-    
-    // Get input and output tensors
-    input = interpreter->input(0);
-    output = interpreter->output(0);
-    
-    // Cache initial input dims (expect 4D: [1, H, W, C])
-    if (input && input->dims && input->dims->size == 4) {
-     g_model_input_height = input->dims->data[1];
-     g_model_input_width  = input->dims->data[2];
-     g_model_input_channels = input->dims->data[3];
-    }
-    printf("Core 1: TensorFlow Lite initialized successfully\n");
-    printf("Core 1: Model size: %u bytes\n", model_data_len);
-    printf("Core 1: Input tensor type: %d, dims: %d x %d x %d x %d\n",
-        input->type, input->dims->data[0], input->dims->data[1],
-        input->dims->data[2], input->dims->data[3]);
-    printf("Core 1: Output tensor type: %d, dims: %d x %d\n",
-           output->type, output->dims->data[0], output->dims->data[1]);
-    printf("Core 1: Cached input dims: %dx%dx%d\n", g_model_input_width, g_model_input_height, g_model_input_channels);
-    
-    // Signal that initialization is complete
-    uint32_t init_complete = CMD_INFERENCE_COMPLETE;
-    queue_try_add(&core1_to_core0_queue, &init_complete);
-    
-    // Main processing loop
-    uint32_t command;
-    
+    printf("[ML] Arena used ≈ %d bytes (of %u)\n", used, (unsigned)kTensorArenaSize);
+    printf("[ML] Suggest new arena: %d KB (used + 8KB margin)\n", (used + 8192 + 1023)/1024);
+#endif
+    s_input  = s_interpreter->input(0);
+    s_output = s_interpreter->output(0);
+    if (!s_input || !s_output) { printf("[ML] Missing tensors\n"); uint32_t e = CMD_ERROR; queue_try_add(&q_core1_to_core0, &e); return; }
+
+    if (s_input->dims->size == 4) { g_input_h = s_input->dims->data[1]; g_input_w = s_input->dims->data[2]; g_input_c = s_input->dims->data[3]; }
+    printf("[ML] Model loaded (%u bytes) input=%dx%dx%d type=%d output_type=%d\n", model_data_len, g_input_w, g_input_h, g_input_c, s_input->type, s_output->type);
+    uint32_t ok = CMD_DONE; queue_try_add(&q_core1_to_core0, &ok);
+
+    // Command loop
+    uint32_t cmd;
     while (true) {
-        // Wait for a command from Core 0
-        if (queue_try_remove(&core0_to_core1_queue, &command)) {
-            if (command == CMD_PROCESS_IMAGE) {
-                // Get a lock on the shared memory
-                uint32_t save = spin_lock_blocking(memory_lock);
-                
-                // Process the captured image
-                bool process_success = process_image_for_inference(
-                    g_capture_buffer, g_capture_size, g_process_buffer,
-                    g_model_input_width, g_model_input_height);
-                
-                // Release the lock
-                spin_unlock(memory_lock, save);
-                
-                if (!process_success) {
-                    printf("Core 1: Image processing failed\n");
-                    uint32_t error_cmd = CMD_ERROR;
-                    queue_try_add(&core1_to_core0_queue, &error_cmd);
-                    continue;
-                }
-                
-                // Fill input tensor with processed image
-                fill_input_tensor(g_process_buffer);
-                
-                // Run inference with timing
-                absolute_time_t inference_start = get_absolute_time();
-                
-                TfLiteStatus invoke_status = interpreter->Invoke();
-                
-                uint32_t inference_time_ms = absolute_time_diff_us(
-                    inference_start, get_absolute_time()) / 1000;
-                
-          printf("Core 1: Inference took %u ms (input %dx%dx%d)\n", inference_time_ms,
-              g_model_input_width, g_model_input_height, g_model_input_channels);
-                
-                if (invoke_status != kTfLiteOk) {
-                    printf("Core 1: Inference failed with status: %d\n", invoke_status);
-                    uint32_t error_cmd = CMD_ERROR;
-                    queue_try_add(&core1_to_core0_queue, &error_cmd);
-                    continue;
-                }
-                
-                // Process results and store in shared memory
-                save = spin_lock_blocking(memory_lock);
-                InferenceResult* result = (InferenceResult*)&g_inference_result;
-                result->inference_time_ms = inference_time_ms;
-                postprocess_output(output, result); // use helper
-                spin_unlock(memory_lock, save);
-                
-                // Signal that inference is complete
-                uint32_t complete_cmd = CMD_INFERENCE_COMPLETE;
-                queue_try_add(&core1_to_core0_queue, &complete_cmd);
+        if (queue_try_remove(&q_core0_to_core1, &cmd)) {
+            if (cmd == CMD_PROCESS_IMAGE) {
+                // Critical section: copy size and decode
+                uint32_t save = spin_lock_blocking(g_spinlock);
+                uint32_t local_size = g_jpeg_size; (void)local_size; // size already validated on capture
+                spin_unlock(g_spinlock, save);
+
+                if (!decode_and_resize_to_model(g_rgb_buffer, g_input_w, g_input_h)) { uint32_t e = CMD_ERROR; queue_try_add(&q_core1_to_core0, &e); continue; }
+                if (!populate_input(g_rgb_buffer)) { uint32_t e = CMD_ERROR; queue_try_add(&q_core1_to_core0, &e); continue; }
+
+                absolute_time_t t0 = get_absolute_time();
+                TfLiteStatus st = s_interpreter->Invoke();
+                uint32_t elapsed = absolute_time_diff_us(t0, get_absolute_time()) / 1000;
+                if (st != kTfLiteOk) { printf("[ML] Invoke failed (%d)\n", st); uint32_t e = CMD_ERROR; queue_try_add(&q_core1_to_core0, &e); continue; }
+
+                save = spin_lock_blocking(g_spinlock);
+                InferenceResult* r = (InferenceResult*)&g_shared_result;
+                r->inference_time_ms = elapsed;
+#if APP_ENABLE_TIMING
+                // accumulate decode/resize + invoke inside core1 to avoid sync overhead
+                g_timing.decode_ms += g_last_decode_ms;
+                g_timing.resize_ms += g_last_resize_ms;
+                g_timing.invoke_ms += elapsed;
+                // capture_ms added on core0 after capture
+#endif
+                postprocess_output(s_output, r);
+                spin_unlock(g_spinlock, save);
+
+                uint32_t d = CMD_DONE; queue_try_add(&q_core1_to_core0, &d);
             }
         }
-        // Small sleep to avoid tight loop
-        sleep_us(100);
+        sleep_us(80); // yield
     }
 }
 
-// Capture a JPEG image from Arducam into buffer
-bool capture_image_to_buffer(uint8_t *buffer, size_t buffer_size, uint32_t *captured_size) {
-    debug_print("Capturing image from Arducam...");
-
-    // Take a picture in 128x128 JPEG mode
-    CamStatus status = myCAM.takePicture(CAM_IMAGE_MODE_128X128, CAM_IMAGE_PIX_FMT_JPG);
-    if (status != CAM_ERR_SUCCESS) {
-        printf("Arducam: takePicture failed (%d)\n", status);
-        return false;
-    }
-
-    // Get the image length
-    uint32_t img_len = myCAM.getTotalLength();
-    if (img_len == 0 || img_len > buffer_size) {
-        printf("Arducam: Invalid image length: %lu\n", img_len);
-        return false;
-    }
-
-    // Read image data into buffer in chunks (max 255 bytes per call)
-    uint32_t bytes_read = 0;
-    while (bytes_read < img_len) {
-        uint8_t chunk = 128;
-        if (img_len - bytes_read < chunk) chunk = img_len - bytes_read;
-        if (chunk > 255) chunk = 255;
-        bytes_read += myCAM.readBuff(buffer + bytes_read, chunk);
-    }
-
-    *captured_size = img_len;
-    printf("Arducam: Image captured, size: %lu bytes\n", img_len);
-    return true;
-}
-
-// Print memory information
-void print_memory_info() {
-    extern char __StackLimit, __bss_end__;
-    printf("Free RAM: %d bytes\n", &__StackLimit - &__bss_end__);
-}
-
-// Main function - runs on Core 0
+// ---------------------------------------------------------------------------
+// Application (Core0)
+// ---------------------------------------------------------------------------
 int main() {
-    // Set inference result as invalid initially
-    g_inference_result.valid = false;
+    g_shared_result.valid = false;
+    if (!init_hardware()) { printf("[APP] Hardware init failed\n"); while (true) sleep_ms(1000); }
+    if (!init_camera())   { printf("[APP] Camera init failed\n"); while (true) sleep_ms(1000); }
+    print_free_ram();
 
-    // Initialize all components
-    if (!setup_hardware()) {
-        printf("Hardware setup failed\n");
-        while (true)
-            sleep_ms(1000); // Halt
-    }
-    
-    if (!setup_camera()) {
-        printf("Camera setup failed\n");
-        while (true)
-            sleep_ms(1000); // Halt
-    }
-    
-    print_memory_info();
-    
-    // Launch Core 1 for ML processing
     multicore_launch_core1(core1_entry);
-    
-    // Wait for Core 1 to initialize TFLite
-    printf("Core 0: Waiting for TensorFlow Lite initialization...\n");
-    
-    uint32_t response;
-    bool init_success = false;
-    absolute_time_t timeout = make_timeout_time_ms(10000);  // 10 second timeout
-    
-    while (!init_success) {
-        if (queue_try_remove(&core1_to_core0_queue, &response)) {
-            if (response == CMD_INFERENCE_COMPLETE) {
-                init_success = true;
-            }
-            else if (response == CMD_ERROR) {
-                printf("Core 0: Error during TensorFlow initialization\n");
-                while (true)
-                    sleep_ms(1000); // Halt
-            }
-        }
-        
-        // Check for timeout
-        if (absolute_time_diff_us(get_absolute_time(), timeout) <= 0) {
-            printf("Core 0: Timeout waiting for TensorFlow initialization\n");
-            while (true)
-                sleep_ms(1000); // Halt
-        }
-        
+    printf("[APP] Waiting for model init...\n");
+    absolute_time_t init_to = make_timeout_time_ms(kInitTimeoutMs);
+    bool ready = false; uint32_t resp;
+    while (!ready) {
+        if (queue_try_remove(&q_core1_to_core0, &resp)) {
+            if (resp == CMD_DONE) ready = true; else if (resp == CMD_ERROR) { printf("[APP] Model init error\n"); while (true) sleep_ms(1000);} }
+        if (absolute_time_diff_us(get_absolute_time(), init_to) <= 0) { printf("[APP] Init timeout\n"); while (true) sleep_ms(1000);} 
         sleep_ms(10);
     }
-    
-    printf("Core 0: TensorFlow Lite initialization complete!\n");
-    printf("Core 0: Starting main detection loop...\n");
-    
-    // Main processing loop
-    while (true) {
-        printf("Core 0: Capturing new image...\n");
-        
-        // Capture image
-        uint32_t capture_size = 0;
-        bool capture_success = capture_image_to_buffer(
-            g_capture_buffer, sizeof(g_capture_buffer), &capture_size);
-            
-        if (!capture_success) {
-            printf("Core 0: Image capture failed\n");
-            sleep_ms(1000);
-            continue;
-        }
-        
-        // Set the capture size in the shared memory
-        uint32_t save = spin_lock_blocking(memory_lock);
-        g_capture_size = capture_size;
-        spin_unlock(memory_lock, save);
-        
-        printf("Core 0: Processing image...\n");
-        
-        // Signal Core 1 to process the image
-        uint32_t process_cmd = CMD_PROCESS_IMAGE;
-        queue_try_add(&core0_to_core1_queue, &process_cmd);
-        
-        // Wait for Core 1 to complete processing
-        bool processing_complete = false;
-        bool processing_error = false;
-        absolute_time_t timeout = make_timeout_time_ms(5000);  // 5 second timeout
-        
-        while (!processing_complete && !processing_error) {
-            // Check for response from Core 1
-            uint32_t response;
-            if (queue_try_remove(&core1_to_core0_queue, &response)) {
-                if (response == CMD_INFERENCE_COMPLETE) {
-                    processing_complete = true;
-                }
-                else if (response == CMD_ERROR) {
-                    processing_error = true;
-                    printf("Core 0: Error during inference\n");
-                }
-            }
-            
-            // Check for timeout
-            if (absolute_time_diff_us(get_absolute_time(), timeout) <= 0) {
-                printf("Core 0: Timeout waiting for inference\n");
-                processing_error = true;
-            }
-            
-            sleep_ms(10);
-        }
-        
-        if (processing_error) {
-            printf("Core 0: Processing error, retrying...\n");
-            sleep_ms(1000);
-            continue;
-        }
-        
-        // Print the inference results
-        save = spin_lock_blocking(memory_lock);
-        InferenceResult result;
-        // Manually copy volatile struct members
-        for (int i = 0; i < kNumClasses; i++) {
-            result.scores[i] = g_inference_result.scores[i];
-            result.predictions[i] = g_inference_result.predictions[i];
-        }
-        result.inference_time_ms = g_inference_result.inference_time_ms;
-        result.valid = g_inference_result.valid;
-        spin_unlock(memory_lock, save);
-        
-        print_inference_results(&result);
-               
-        // Delay before next capture
-        sleep_ms(2000); // 2 second delay between detections
-    }
+    printf("[APP] Model ready. Entering loop...\n");
 
+    while (true) {
+    uint32_t cap_ms = 0;
+    if (!capture_jpeg(&cap_ms)) { sleep_ms(500); continue; }
+#if APP_ENABLE_TIMING
+    g_timing.capture_ms += cap_ms;
+#endif
+        uint32_t save = spin_lock_blocking(g_spinlock);
+        spin_unlock(g_spinlock, save);
+        uint32_t c = CMD_PROCESS_IMAGE; queue_try_add(&q_core0_to_core1, &c);
+
+        bool done = false; bool err = false; absolute_time_t to = make_timeout_time_ms(kInvokeTimeoutMs);
+        while (!done && !err) {
+            if (queue_try_remove(&q_core1_to_core0, &resp)) { if (resp == CMD_DONE) done = true; else if (resp == CMD_ERROR) err = true; }
+            if (absolute_time_diff_us(get_absolute_time(), to) <= 0) { printf("[APP] Inference timeout\n"); err = true; }
+            sleep_ms(8);
+        }
+        if (!err) {
+            save = spin_lock_blocking(g_spinlock);
+            InferenceResult local; 
+            local.inference_time_ms = g_shared_result.inference_time_ms;
+            local.valid = g_shared_result.valid;
+            for (int i = 0; i < kNumClasses; ++i) { local.scores[i] = g_shared_result.scores[i]; local.predictions[i] = g_shared_result.predictions[i]; }
+            spin_unlock(g_spinlock, save);
+            print_result(local);
+#if APP_ENABLE_TIMING
+            g_timing.frames++;
+            if (g_timing.frames % 8 == 0) { g_timing.print_and_reset(); }
+#endif
+        } else {
+            printf("[APP] Inference error, retrying...\n");
+        }
+        sleep_ms(kLoopDelayMs);
+    }
     return 0;
 }

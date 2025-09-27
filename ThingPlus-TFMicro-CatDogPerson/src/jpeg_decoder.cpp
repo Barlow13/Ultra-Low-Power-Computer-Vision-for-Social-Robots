@@ -8,8 +8,9 @@
  #include <cstdio>
  #include <cstring>
  
- // Buffer for decoded pixels
- static uint8_t g_decoded_buffer[MAX_DECODED_WIDTH * MAX_DECODED_HEIGHT * 3]; // RGB format
+// (Removed) Dedicated decoded pixel buffer was only used by the old streaming
+// helper. We now decode directly into the caller-provided output buffer to
+// conserve static RAM.
  
  // JPEG buffer index for feeding data to decoder
  static uint32_t g_jpeg_buffer_index;
@@ -159,46 +160,4 @@
      return true;
  }
  
- /**
-  * Decode JPEG and downscale to grayscale with specific dimensions
-  */
- bool jpeg_decode_to_model_input(const uint8_t* jpeg_data, uint32_t jpeg_data_size, 
-                                 uint8_t* output_buffer, uint32_t target_width, uint32_t target_height) {
-     uint32_t width, height;
-     
-     // Use stack-allocated buffer for RGB data to avoid large static buffer
-     uint8_t* rgb_buffer = g_decoded_buffer;
-     
-     if (!jpeg_decode_to_rgb(jpeg_data, jpeg_data_size, rgb_buffer, &width, &height)) {
-         return false;
-     }
-     
-     // Now downscale and convert to grayscale for model input
-     for (uint32_t y = 0; y < target_height; y++) {
-         for (uint32_t x = 0; x < target_width; x++) {
-             // Calculate source coordinate with proper scaling
-             uint32_t src_x = x * width / target_width;
-             uint32_t src_y = y * height / target_height;
-             
-             // Ensure we don't go out of bounds
-             if (src_x >= width) src_x = width - 1;
-             if (src_y >= height) src_y = height - 1;
-             
-             // Get source pixel
-             uint32_t src_ofs = (src_y * width + src_x) * 3;
-             
-             // Simple RGB to grayscale conversion
-             uint8_t r = rgb_buffer[src_ofs + 0];
-             uint8_t g = rgb_buffer[src_ofs + 1];
-             uint8_t b = rgb_buffer[src_ofs + 2];
-             
-             // Standard grayscale conversion (luminance)
-             uint8_t gray = (uint8_t)(0.299f * r + 0.587f * g + 0.114f * b);
-             
-             // Store to output buffer
-             output_buffer[y * target_width + x] = gray;
-         }
-     }
-     
-     return true;
- }
+ // (Removed) jpeg_decode_to_model_input: see header for rationale.
