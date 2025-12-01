@@ -1,3 +1,19 @@
+"""
+Brady Barlow
+Oklahoma State University
+11/28/2025
+
+Balanced Multi-Label Dataset Generator for TensorFlow
+This script processes a multi-label image dataset (e.g., COCO) to create a balanced
+dataset suitable for training TensorFlow models. It supports undersampling, oversampling,
+and mixed strategies to balance class distributions, and outputs CSV files for training
+and validation splits.
+
+Usage Example:
+python -u Dataset.py
+
+"""
+
 import os
 import csv
 import random
@@ -15,12 +31,12 @@ class_names = ['person', 'dog', 'cat', 'none']
 image_extensions = ('.jpg', '.jpeg', '.png')
 
 # Balance settings
-BALANCE_STRATEGY = 'mixed'  # 'undersample', 'oversample', 'mixed'
-TARGET_RATIO = [1.0, 1.0, 1.0]  # Target ratio for [person, dog, cat]
-MAX_SAMPLES_PER_CLASS = 5000  # Maximum samples per class
-MIN_SAMPLES_PER_CLASS = 2000  # Minimum samples per class
-MAX_NEG_RATIO = 0.2  # 20% negative samples
-OVERSAMPLE_FACTOR = 3  # How many times to duplicate rare samples
+BALANCE_STRATEGY = 'mixed'       # 'undersample', 'oversample', 'mixed'
+TARGET_RATIO = [1.0, 1.0, 1.0]   # Target ratio for [person, dog, cat]
+MAX_SAMPLES_PER_CLASS = 50000    # Maximum samples per class
+MIN_SAMPLES_PER_CLASS = 4000     # ensure dog/cat at least try to reach this
+MAX_NEG_RATIO = 0.1              # fewer negatives
+OVERSAMPLE_FACTOR = 5            # stronger oversampling for dog/cat
 
 train_val_split = 0.8
 
@@ -97,7 +113,7 @@ def balance_dataset(samples, strategy='mixed'):
     """Balance dataset using specified strategy"""
     class_samples, negative_samples, multi_label_samples = analyze_dataset(samples)
     
-    print("\n📊 Original class distribution:")
+    print("\nOriginal class distribution:")
     for cls in class_names:
         print(f"   {cls}: {len(class_samples[cls])}")
     print(f"   negative: {len(negative_samples)}")
@@ -110,7 +126,7 @@ def balance_dataset(samples, strategy='mixed'):
         min_count = min(len(class_samples[cls]) for cls in class_names)
         target_count = min(min_count, MAX_SAMPLES_PER_CLASS)
         
-        print(f"\n⬇️  Undersampling to {target_count} samples per class")
+        print(f"\n⬇Undersampling to {target_count} samples per class")
         
         for cls in class_names:
             sampled = random.sample(class_samples[cls], 
@@ -122,7 +138,7 @@ def balance_dataset(samples, strategy='mixed'):
         max_count = max(len(class_samples[cls]) for cls in class_names)
         target_count = min(max_count, MAX_SAMPLES_PER_CLASS)
         
-        print(f"\n⬆️  Oversampling to {target_count} samples per class")
+        print(f"\n⬆Oversampling to {target_count} samples per class")
         
         for cls in class_names:
             samples_list = class_samples[cls]
@@ -145,7 +161,7 @@ def balance_dataset(samples, strategy='mixed'):
         target_count = min(median_count * 2, MAX_SAMPLES_PER_CLASS)
         target_count = max(target_count, MIN_SAMPLES_PER_CLASS)
         
-        print(f"\n🔄 Mixed strategy: target {target_count} samples per class")
+        print(f"\nMixed strategy: target {target_count} samples per class")
         
         for cls in class_names:
             samples_list = class_samples[cls]
@@ -153,14 +169,14 @@ def balance_dataset(samples, strategy='mixed'):
             
             if current_count > target_count:
                 # Undersample
-                print(f"   ⬇️  Undersampling {cls}: {current_count} → {target_count}")
+                print(f"   Undersampling {cls}: {current_count} → {target_count}")
                 sampled = random.sample(samples_list, target_count)
                 balanced_samples.extend(sampled)
             elif current_count < target_count:
                 # Oversample
                 factor = min(OVERSAMPLE_FACTOR, target_count // current_count)
                 new_count = min(current_count * factor, target_count)
-                print(f"   ⬆️  Oversampling {cls}: {current_count} → {new_count}")
+                print(f"   Oversampling {cls}: {current_count} → {new_count}")
                 
                 balanced_samples.extend(samples_list)
                 if factor > 1:
@@ -170,32 +186,22 @@ def balance_dataset(samples, strategy='mixed'):
             else:
                 balanced_samples.extend(samples_list)
     
-    # Remove duplicates while preserving multi-label samples
-    seen = set()
-    unique_balanced = []
-    
-    # First, add all multi-label samples (they're valuable)
+    # Keep duplicates to fully apply oversampling/undersampling
+    # First, ensure all multi-label samples are present
+    multi_label_set = {s[0] for s in multi_label_samples}
     for sample in multi_label_samples:
-        if sample[0] not in seen:
-            unique_balanced.append(sample)
-            seen.add(sample[0])
-    
-    # Then add single-label samples
-    for sample in balanced_samples:
-        if sample[0] not in seen:
-            unique_balanced.append(sample)
-            seen.add(sample[0])
-    
+        balanced_samples.append(sample)
+
     # Add negative samples (limited)
-    num_positives = len(unique_balanced)
+    num_positives = len(balanced_samples)
     max_negatives = int(num_positives * MAX_NEG_RATIO)
     
     if negative_samples:
         neg_to_add = min(len(negative_samples), max_negatives)
-        print(f"\n➕ Adding {neg_to_add} negative samples ({MAX_NEG_RATIO*100:.0f}% of positives)")
-        unique_balanced.extend(random.sample(negative_samples, neg_to_add))
+        print(f"\nAdding {neg_to_add} negative samples ({MAX_NEG_RATIO*100:.0f}% of positives)")
+        balanced_samples.extend(random.sample(negative_samples, neg_to_add))
     
-    return unique_balanced
+    return balanced_samples
 
 def augment_minority_classes(samples, minority_threshold=0.1):
     """Create synthetic variations for minority classes"""
@@ -210,17 +216,14 @@ def augment_minority_classes(samples, minority_threshold=0.1):
                        if count / total_positive < minority_threshold]
     
     if minority_classes:
-        print(f"\n🔧 Augmenting minority classes: {minority_classes}")
-        # In practice, you'd apply transformations here
-        # For now, we'll just duplicate some samples
-        
+        print(f"\nAugmenting minority classes: {minority_classes}")        
     return samples
 
 # === MAIN PROCESSING ===
 if __name__ == '__main__':
-    print(f"🚀 Balanced Dataset Generator for Multi-Label Classification")
-    print(f"🔧 Using {num_processes} processes")
-    print(f"⚖️  Balance strategy: {BALANCE_STRATEGY}")
+    print(f"Balanced Dataset Generator for Multi-Label Classification")
+    print(f"Using {num_processes} processes")
+    print(f"Balance strategy: {BALANCE_STRATEGY}")
     start_time = time.time()
     
     all_results = []
@@ -231,12 +234,12 @@ if __name__ == '__main__':
         image_dir = os.path.join(dataset_root, 'images', split)
         
         if not os.path.exists(label_dir):
-            print(f"⚠️  Warning: {label_dir} not found, skipping...")
+            print(f"Warning: {label_dir} not found, skipping...")
             continue
         
-        print(f"\n📁 Processing {split}...")
+        print(f"\nProcessing {split}...")
         label_files = os.listdir(label_dir)
-        print(f"📊 Found {len(label_files)} files to process")
+        print(f"Found {len(label_files)} files to process")
         
         # Prepare arguments
         args_list = [(f, label_dir, image_dir, dataset_root) for f in label_files]
@@ -256,10 +259,10 @@ if __name__ == '__main__':
             
             all_results.extend(results)
         
-        print(f"✅ {split} completed in {time.time() - split_start:.2f} seconds")
+        print(f"{split} completed in {time.time() - split_start:.2f} seconds")
     
-    print(f"\n⏱️  Total processing time: {time.time() - start_time:.2f} seconds")
-    print(f"📊 Total samples found: {len(all_results)}")
+    print(f"\nTotal processing time: {time.time() - start_time:.2f} seconds")
+    print(f"Total samples found: {len(all_results)}")
     
     # Balance the dataset
     print("\n" + "="*50)
@@ -281,7 +284,7 @@ if __name__ == '__main__':
             if present:
                 final_class_counts[class_names[i]] += 1
     
-    print("\n📊 Final balanced distribution:")
+    print("\nFinal balanced distribution:")
     total_balanced = sum(final_class_counts.values())
     for cls in class_names:
         count = final_class_counts[cls]
@@ -289,7 +292,7 @@ if __name__ == '__main__':
         print(f"   {cls}: {count} ({percentage:.1f}%)")
     
     # Write CSVs
-    print("\n💾 Writing CSV files...")
+    print("\nWriting CSV files...")
     
     def write_csv(filename, data):
         with open(filename, 'w', newline='') as f:
@@ -309,8 +312,8 @@ if __name__ == '__main__':
     write_csv(train_csv, balanced_dataset[:split_idx])
     write_csv(val_csv, balanced_dataset[split_idx:])
     
-    print(f"\n✅ Complete! Total time: {time.time() - start_time:.2f} seconds")
-    print(f"📄 Created:")
+    print(f"\nComplete! Total time: {time.time() - start_time:.2f} seconds")
+    print(f"Created:")
     print(f"   - {os.path.basename(output_csv)} ({len(balanced_dataset)} samples)")
     print(f"   - {os.path.basename(train_csv)} ({split_idx} samples)")
     print(f"   - {os.path.basename(val_csv)} ({len(balanced_dataset) - split_idx} samples)")
@@ -328,4 +331,4 @@ if __name__ == '__main__':
             percentage = (count / total_balanced * 100) if total_balanced > 0 else 0
             f.write(f"  {cls}: {count} ({percentage:.1f}%)\n")
     
-    print(f"\n📄 Balance report saved to: {report_path}")
+    print(f"\nBalance report saved to: {report_path}")

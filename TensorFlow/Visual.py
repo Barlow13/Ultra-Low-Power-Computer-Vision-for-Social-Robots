@@ -1,3 +1,18 @@
+"""
+Brady Barlow
+Oklahoma State University
+11/28/2025
+
+TensorFlow Lite Visual Inference Script
+This script processes images using a TensorFlow Lite model.
+It can create a grid visualization of random validation images with predictions,
+and evaluate the model on the full validation set, saving metrics and confusion plots.
+
+Usage Example:
+python -u Visual.py --grid 48 --rows 6 --cols 8 --csv --confusion --seed 42
+
+"""
+
 import os, json, random, argparse
 import numpy as np
 import pandas as pd
@@ -12,12 +27,12 @@ except:
 
 EXPORT_DIR = './export'
 DATASET_ROOT = '../datasets/coco'
-MODEL_NAME = 'SmallMobileNetV2'  # adjust if different
+MODEL_NAME = 'BSB-PicoVision'  
 TFLITE_PATH = os.path.join(EXPORT_DIR, f'{MODEL_NAME}.tflite')
 VAL_CSV = os.path.join(DATASET_ROOT, 'balanced_multilabel_val.csv')
 CLASSES = ['person', 'dog', 'cat', 'none']
 IMG_SIZE = 96
-NUM_CLASSES = len(CLASSES)  # FIX: was missing
+NUM_CLASSES = len(CLASSES)
 
 # Load metadata thresholds (fallback to 0.5)
 meta_path = os.path.join(EXPORT_DIR, 'metadata.json')
@@ -31,6 +46,14 @@ else:
     QUANT_MODE = 'float16'
 
 df_val = pd.read_csv(VAL_CSV)
+
+def fix_path(p):
+    p = str(p).replace('\\', '/')
+    if 'images/' in p:
+        p = p[p.index('images/'):]
+    return p
+
+df_val['image'] = df_val['image'].apply(fix_path)
 
 interpreter = tf.lite.Interpreter(model_path=TFLITE_PATH)
 interpreter.allocate_tensors()
@@ -78,11 +101,9 @@ def visualize(num_images=24, rows=4, cols=6, seed=None, show_bars=False):
         true_labels = [c for c in CLASSES if row[c] == 1]
         show_img = cv2.resize(cv2.cvtColor(img_bgr, cv2.COLOR_BGR2RGB), (IMG_SIZE, IMG_SIZE))
         if show_bars:
-            # Create a taller canvas to add a tiny probability bar
             bar_h = 14
             canvas = np.ones((IMG_SIZE + bar_h, IMG_SIZE, 3), dtype=np.uint8) * 255
             canvas[:IMG_SIZE] = show_img
-            # Draw probability bars
             for ci, p in enumerate(probs):
                 x0 = int(ci * IMG_SIZE / NUM_CLASSES)
                 x1 = int((ci+1) * IMG_SIZE / NUM_CLASSES)

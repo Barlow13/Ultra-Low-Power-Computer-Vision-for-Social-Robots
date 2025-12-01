@@ -1,1 +1,3 @@
-datasets
+datasets/coco/annotations
+datasets/coco/images
+datasets/coco/labels

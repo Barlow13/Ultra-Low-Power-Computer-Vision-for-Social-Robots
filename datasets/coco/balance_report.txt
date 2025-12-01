@@ -1,0 +1,10 @@
+Dataset Balance Report
+==================================================
+Strategy: mixed
+Total samples: 146819
+
+Class distribution:
+  person: 66990 (39.8%)
+  dog: 27797 (16.5%)
+  cat: 24012 (14.3%)
+  none: 49560 (29.4%)

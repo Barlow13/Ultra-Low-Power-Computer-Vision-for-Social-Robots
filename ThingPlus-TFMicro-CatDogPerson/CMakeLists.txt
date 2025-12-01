@@ -26,7 +26,7 @@ set(PICO_BOARD sparkfun_thingplus CACHE STRING "Board type")
 # Pull in Raspberry Pi Pico SDK (must be before project)
 include(pico_sdk_import.cmake)
 
-project(PicoRoadDetector C CXX ASM)
+project(BSB-PICOVISION C CXX ASM)
 
 # Initialise the Raspberry Pi Pico SDK
 pico_sdk_init()
@@ -162,32 +162,34 @@ ${CMAKE_CURRENT_LIST_DIR}/pico-tflmicro/src/third_party/cmsis/CMSIS/NN/Source/NN
 )
 
 # Add executable
-add_executable(PicoRoadDetector
+add_executable(BSB-PICOVISION
     src/main.cpp
     src/jpeg_decoder.cpp
     src/picojpeg.c
     src/Arducam/Arducam_Mega.cpp
     src/Arducam/ArducamCamera.c
     src/Arducam/cam_spi_master.c
+    src/oled_ssd1306.cpp
   src/model_data.cc
 )
 
 # Add include directories for main executable
-target_include_directories(PicoRoadDetector PRIVATE
+target_include_directories(BSB-PICOVISION PRIVATE
   ${CMAKE_CURRENT_LIST_DIR}
   ${CMAKE_CURRENT_LIST_DIR}/src
   ${CMAKE_CURRENT_LIST_DIR}/pico-tflmicro/src
 )
 
 # Add compile definitions for main executable
-target_compile_definitions(PicoRoadDetector PRIVATE
+target_compile_definitions(BSB-PICOVISION PRIVATE
   TF_LITE_MCU_DEBUG_LOG=1
   BYTE_ALREADY_DEFINED=1
   TF_LITE_MICRO_USE_CMSIS_NN=1
+  APP_OLED_ENABLE=1
 )
 
 # Set compiler options
-target_compile_options(PicoRoadDetector PRIVATE
+target_compile_options(BSB-PICOVISION PRIVATE
   # Language options
   $<$<COMPILE_LANGUAGE:CXX>:-fno-rtti>
   $<$<COMPILE_LANGUAGE:CXX>:-fno-exceptions>
@@ -203,7 +205,7 @@ target_compile_options(PicoRoadDetector PRIVATE
 )
 
 # Link libraries
-target_link_libraries(PicoRoadDetector PRIVATE
+target_link_libraries(BSB-PICOVISION PRIVATE
   pico-tflmicro
   pico_stdlib
   pico_multicore
@@ -215,8 +217,8 @@ target_link_libraries(PicoRoadDetector PRIVATE
 )
 
 # Enable USB output
-pico_enable_stdio_usb(PicoRoadDetector 1)
-pico_enable_stdio_uart(PicoRoadDetector 1)
+pico_enable_stdio_usb(BSB-PICOVISION 1)
+pico_enable_stdio_uart(BSB-PICOVISION 1)
 
 # Generate additional output files (.uf2, etc.)
-pico_add_extra_outputs(PicoRoadDetector)
+pico_add_extra_outputs(BSB-PICOVISION)

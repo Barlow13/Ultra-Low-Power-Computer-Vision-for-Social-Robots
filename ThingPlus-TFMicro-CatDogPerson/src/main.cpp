@@ -1,18 +1,31 @@
 /**
+ * Brady Barlow
+ * Oklahoma State University
+ * 11/28/2025
+ * ---------------------------------------------------------------------------
  * ThingPlus-TFMicro-CatDogPerson (Main Application)
  * ---------------------------------------------------------------------------
- * Dual‑core RP2040 application performing multi‑label classification
- * (person / dog / cat / none) on frames captured by an Arducam Mega module.
+ * Dual-core RP2040 application performing multi-label classification,
+ * allowing simultaneous detection of multiple classes (person / dog / cat / none)
+ * on frames captured by an Arducam Mega module.
  *
  *  Core0 responsibilities:
  *    - Hardware & camera init
  *    - Frame acquisition (JPEG)
  *    - Shell / logging / scheduling
+ *    - GPIO monitoring (PIN17) with IRQ-based edge detection & debouncing
+ *    - Optional gating: pauses capture when PIN17 is LOW
+ *    - OLED display control (optional, via APP_OLED_ENABLE)
  *
  *  Core1 responsibilities:
  *    - TensorFlow Lite Micro model init
- *    - JPEG decode + resize + pre‑processing
- *    - Running inference & post‑processing
+ *    - JPEG decode + resize + pre-processing
+ *    - Running inference & post-processing
+ *
+ *  Features:
+ *    - PIN17 gating logic (APP_GATE_BY_PIN17)
+ *    - PIN17 debouncing (APP_PIN17_DEBOUNCE_MS)
+ *    - SSD1306 OLED support with runtime power control ('o' key toggle)
  */
 
 #include <cstdio>
@@ -26,10 +39,14 @@
 #include "hardware/gpio.h"
 #include "hardware/sync.h"
 #include "hardware/clocks.h"
+#include "hardware/vreg.h"
 #include "Arducam/Arducam_Mega.h"
 #include "jpeg_decoder.h" 
 #include "picojpeg.h"
 #include "model_data.h"
+#ifdef APP_OLED_ENABLE
+#include "oled_ssd1306.h"
+#endif
 #include "tensorflow/lite/micro/micro_error_reporter.h"
 #include "tensorflow/lite/micro/micro_interpreter.h"
 #include "tensorflow/lite/micro/micro_mutable_op_resolver.h"
@@ -41,73 +58,102 @@
 // ---------------------------------------------------------------------------
 
 #ifndef APP_SPI_BAUD
-#define APP_SPI_BAUD        (8 * 1000 * 1000u)   // 8 MHz
+#define APP_SPI_BAUD        (16 * 1000 * 1000u)   // 16 MHz
 #endif
 #define SPI_PORT            spi0
 #define PIN_SCK             2
 #define PIN_COPI            3
 #define PIN_CIPO            4
 #define PIN_CS              16
+// Optional monitor pin (user request): observe transitions on GPIO 17
+#define PIN_MONITOR         17
+
+// Enable/disable gating the capture/inference loop based on PIN17 (monitor pin) level.
+// 0 = always run (current behavior). 1 = only capture when PIN17 is HIGH. If it goes LOW mid-processing,
+//     the current inference finishes, then the system pauses until PIN17 returns HIGH.
+#ifndef APP_GATE_BY_PIN17
+#define APP_GATE_BY_PIN17 1
+#endif
+
+// Debounce interval (milliseconds) for PIN17 edge logging & gating logic. Set to 0 to disable.
+#ifndef APP_PIN17_DEBOUNCE_MS
+#define APP_PIN17_DEBOUNCE_MS 5
+#endif
+
+// Simple ring buffer to transfer IRQ edge events to main loop (avoid printing in ISR)
+struct PinEvent { uint32_t ts_ms; uint8_t level; };
+static volatile PinEvent g_pin_events[16];
+static volatile uint8_t g_pin_evt_head = 0; // next write
+static volatile uint8_t g_pin_evt_tail = 0; // next read
+static volatile uint8_t g_pin17_level = 0;   // most recent sampled level (updated by ISR)
+static volatile uint32_t g_pin17_last_irq_ms = 0; // last accepted IRQ event time
+static volatile uint8_t g_pin17_last_irq_level = 255; // last pushed level (255=unset)
+
+static inline bool pin_event_buffer_not_empty() {
+    return g_pin_evt_head != g_pin_evt_tail;
+}
+
+static inline bool pin_event_buffer_push(uint8_t level) {
+    uint8_t next = (uint8_t)((g_pin_evt_head + 1) & 0x0F);
+    if (next == g_pin_evt_tail) { return false; } // overflow -> drop
+    g_pin_events[g_pin_evt_head].ts_ms = to_ms_since_boot(get_absolute_time());
+    g_pin_events[g_pin_evt_head].level = level;
+    g_pin_evt_head = next;
+    return true;
+}
+
+static inline bool pin_event_buffer_pop(PinEvent* out) {
+    if (g_pin_evt_head == g_pin_evt_tail) return false;
+    // Copy fields individually to avoid volatile assignment ambiguity
+    volatile PinEvent* src = &g_pin_events[g_pin_evt_tail];
+    out->ts_ms = src->ts_ms;
+    out->level = src->level;
+    g_pin_evt_tail = (uint8_t)((g_pin_evt_tail + 1) & 0x0F);
+    return true;
+}
+
+// ISR callback (shared form). We keep it extremely short.
+static void pin_irq_callback(uint gpio, uint32_t events) {
+    if (gpio == PIN_MONITOR) {
+        uint8_t lvl = (uint8_t)gpio_get(PIN_MONITOR);
+        g_pin17_level = lvl;
+        uint32_t now_ms = to_ms_since_boot(get_absolute_time());
+        // Debounce: require time gap AND a change in level
+        if (g_pin17_last_irq_level != lvl) {
+            if ((APP_PIN17_DEBOUNCE_MS == 0) || (now_ms - g_pin17_last_irq_ms >= (uint32_t)APP_PIN17_DEBOUNCE_MS)) {
+                g_pin17_last_irq_level = lvl;
+                g_pin17_last_irq_ms = now_ms;
+                pin_event_buffer_push(lvl);
+            }
+        }
+    }
+}
 
 #define APP_DEBUG           1
 #define APP_CAPTURE_JPEG_MODE CAM_IMAGE_MODE_96X96
 #define APP_CAPTURE_PIX_FMT   CAM_IMAGE_PIX_FMT_JPG
 
-static constexpr size_t kTensorArenaSize = 170 * 1024;
-
-// Enable one-shot arena usage measurement (set to 1 temporarily). After you
-// read the printed value, set back to 0 and optionally reduce kTensorArenaSize.
-#ifndef APP_ARENA_MEASURE
-#define APP_ARENA_MEASURE 0
-#endif
+static constexpr size_t kTensorArenaSize = 155 * 1024;
 
 // Maximum model input supported by static work buffer (RGB)
-static constexpr int kMaxInputWidth  = 128;
-static constexpr int kMaxInputHeight = 128;
+static constexpr int kMaxInputWidth  = 96;
+static constexpr int kMaxInputHeight = 96;
+
+// Maximum camera capture size (must be >= model input)
+static constexpr int kMaxCaptureWidth  = 96;
+static constexpr int kMaxCaptureHeight = 96;
 
 // JPEG capture buffer size
-static constexpr size_t kMaxJpegSize = 16 * 1024;
+static constexpr size_t kMaxJpegSize = 8 * 1024;
 
-// Inference pacing
-static constexpr uint32_t kLoopDelayMs = 500;  // reduced delay between captures (was 2000)
-// Enable detailed timing (set to 0 to disable quickly)
-#ifndef APP_ENABLE_TIMING
-#define APP_ENABLE_TIMING 1
-#endif
-
-#if APP_ENABLE_TIMING
-struct TimingStats {
-    uint32_t capture_ms = 0;
-    uint32_t decode_ms = 0;
-    uint32_t resize_ms = 0;
-    uint32_t invoke_ms = 0;
-    uint32_t frames = 0;
-    void accumulate(uint32_t c, uint32_t d, uint32_t r, uint32_t i) {
-        capture_ms += c; decode_ms += d; resize_ms += r; invoke_ms += i; ++frames; }
-    void print_and_reset() {
-        if (frames == 0) return;
-        printf("[TIMING] avg over %lu frames | capture=%lu ms decode=%lu ms resize=%lu ms invoke=%lu ms total=%lu ms\n",
-               (unsigned long)frames,
-               (unsigned long)(capture_ms/frames),
-               (unsigned long)(decode_ms/frames),
-               (unsigned long)(resize_ms/frames),
-               (unsigned long)(invoke_ms/frames),
-               (unsigned long)((capture_ms+decode_ms+resize_ms+invoke_ms)/frames));
-        capture_ms = decode_ms = resize_ms = invoke_ms = frames = 0;
-    }
-};
-static TimingStats g_timing;             // shared summary (core0 collects capture; core1 collects rest)
-static volatile uint32_t g_last_decode_ms = 0;
-static volatile uint32_t g_last_resize_ms = 0;
-#endif
+// Timeouts (milliseconds)
 static constexpr uint32_t kInitTimeoutMs = 10000;
 static constexpr uint32_t kInvokeTimeoutMs = 5000;
 
 // Class metadata
-static constexpr int   kNumClasses = 4;
-static constexpr float kClassThresholds[kNumClasses] = {0.55f, 0.30f, 0.35f, 0.25f};
-static constexpr const char* kClassNames[kNumClasses] = {"person", "dog", "cat", "none"};
-
+static constexpr int   kNumClasses = NUM_CLASSES;
+static constexpr const float* kClassThresholds = CLASS_THRESHOLDS;
+static constexpr const char* const* kClassNames = CLASS_NAMES;
 // ---------------------------------------------------------------------------
 // Data structures & shared state
 // ---------------------------------------------------------------------------
@@ -133,7 +179,7 @@ static volatile InferenceResult g_shared_result{};
 
 // Buffers (cache‑line aligned for safety)
 alignas(8) static uint8_t g_jpeg_buffer[kMaxJpegSize];
-alignas(8) static uint8_t g_rgb_buffer[kMaxInputWidth * kMaxInputHeight * 3];
+alignas(8) static uint8_t g_rgb_buffer[kMaxCaptureWidth * kMaxCaptureHeight * 3];
 static volatile uint32_t g_jpeg_size = 0;
 
 // Model state (core1 only after init)
@@ -154,6 +200,9 @@ static volatile int g_input_c = 3;
 
 // Camera instance
 static Arducam_Mega g_camera(PIN_CS);
+#ifdef APP_OLED_ENABLE
+static SSD1306 g_oled;
+#endif
 
 // ---------------------------------------------------------------------------
 // Utility helpers
@@ -231,8 +280,12 @@ static void print_free_ram() {
 static bool init_hardware() {
     stdio_init_all();
     sleep_ms(600); // allow USB CDC to enumerate
-    set_sys_clock_khz(133000, true);
-    dbg("[HW] Clock set to 133 MHz");
+    
+    // Overclock to 240MHz with higher voltage
+    vreg_set_voltage(VREG_VOLTAGE_1_25);
+    sleep_ms(10);
+    set_sys_clock_khz(240000, true);
+    dbg("[HW] Clock set to 240 MHz");
 
     spi_init(SPI_PORT, APP_SPI_BAUD);
     gpio_set_function(PIN_SCK,  GPIO_FUNC_SPI);
@@ -241,6 +294,20 @@ static bool init_hardware() {
     gpio_init(PIN_CS);
     gpio_set_dir(PIN_CS, GPIO_OUT);
     gpio_put(PIN_CS, 1);
+
+    // Setup monitor pin as input (no pull). Adjust pulls if your circuit needs it.
+    gpio_init(PIN_MONITOR);
+    gpio_set_dir(PIN_MONITOR, GPIO_IN);
+    // If the line can float, uncomment one of the below:
+    // gpio_pull_up(PIN_MONITOR);
+    gpio_pull_down(PIN_MONITOR);
+
+    // Install IRQ for both edges (one global callback is fine)
+    gpio_set_irq_enabled_with_callback(PIN_MONITOR, GPIO_IRQ_EDGE_RISE | GPIO_IRQ_EDGE_FALL, true, &pin_irq_callback);
+
+    // Initialize cached level
+    g_pin17_level = (uint8_t)gpio_get(PIN_MONITOR);
+
 
     g_spinlock = spin_lock_init(0);
     queue_init(&q_core0_to_core1, sizeof(uint32_t), 4);
@@ -254,18 +321,15 @@ static bool init_camera() {
     g_camera.begin();
     g_camera.setRotation(CAM_ROTATION_180);
     g_camera.setAutoFocus(1);
-    g_camera.setAutoExposure(1);
-    g_camera.setAutoWhiteBalance(1);
-    g_camera.setAutoISOSensitive(1);
+    g_camera.setAutoExposure(0);
+    g_camera.setAutoWhiteBalance(0);
+    g_camera.setAutoISOSensitive(0);
     dbg("[CAM] Ready");
     return true;
 }
 
 // Capture JPEG into shared buffer (Core0)
-static bool capture_jpeg(uint32_t* elapsed_ms_out) {
-#if APP_ENABLE_TIMING
-    absolute_time_t t0 = get_absolute_time();
-#endif
+static bool capture_jpeg() {
     CamStatus st = g_camera.takePicture(APP_CAPTURE_JPEG_MODE, APP_CAPTURE_PIX_FMT);
     if (st != CAM_ERR_SUCCESS) { printf("[CAM] takePicture failed (%d)\n", st); return false; }
     uint32_t len = g_camera.getTotalLength();
@@ -277,9 +341,6 @@ static bool capture_jpeg(uint32_t* elapsed_ms_out) {
     }
     g_jpeg_size = len;
     printf("[CAM] Captured %lu bytes\n", (unsigned long)len);
-#if APP_ENABLE_TIMING
-    if (elapsed_ms_out) *elapsed_ms_out = absolute_time_diff_us(t0, get_absolute_time())/1000;
-#endif
     return true;
 }
 
@@ -289,14 +350,8 @@ static bool capture_jpeg(uint32_t* elapsed_ms_out) {
 
 static bool decode_and_resize_to_model(uint8_t* rgb_out, int target_w, int target_h) {
     uint32_t dec_w = 0, dec_h = 0;
-#if APP_ENABLE_TIMING
-    absolute_time_t t_dec0 = get_absolute_time();
-#endif
     if (!jpeg_decode_to_rgb(g_jpeg_buffer, g_jpeg_size, rgb_out, &dec_w, &dec_h)) {
         printf("[ML] JPEG decode failed\n"); return false; }
-#if APP_ENABLE_TIMING
-    g_last_decode_ms = absolute_time_diff_us(t_dec0, get_absolute_time())/1000;
-#endif
     if ((int)dec_w == target_w && (int)dec_h == target_h) return true;
     if (target_w > kMaxInputWidth || target_h > kMaxInputHeight) {
         printf("[ML] Target dims exceed buffer (%dx%d)\n", target_w, target_h); return false; }
@@ -305,9 +360,6 @@ static bool decode_and_resize_to_model(uint8_t* rgb_out, int target_w, int targe
     // (due to sx>=x and sy>=y with integer floor after scaling). We iterate forward.
     const int src_w = (int)dec_w;
     const int src_h = (int)dec_h;
-#if APP_ENABLE_TIMING
-    absolute_time_t t_res0 = get_absolute_time();
-#endif
     for (int y = 0; y < target_h; ++y) {
         int sy = y * src_h / target_h; if (sy >= src_h) sy = src_h - 1;
         for (int x = 0; x < target_w; ++x) {
@@ -319,9 +371,6 @@ static bool decode_and_resize_to_model(uint8_t* rgb_out, int target_w, int targe
             rgb_out[didx+2] = rgb_out[sidx+2];
         }
     }
-#if APP_ENABLE_TIMING
-    g_last_resize_ms = absolute_time_diff_us(t_res0, get_absolute_time())/1000;
-#endif
     return true;
 }
 
@@ -341,8 +390,29 @@ static bool populate_input(const uint8_t* rgb) {
         case kTfLiteInt8: {
             int8_t* dst = s_input->data.int8; float sc = s_input->params.scale; int zp = s_input->params.zero_point;
             if (sc == 0) { printf("[ML] Invalid int8 scale=0\n"); return false; }
+            
+            // Optimization: Use a lookup table to avoid 27k+ floating point operations per frame
+            // RP2040 has no FPU, so float math is slow.
+            static int8_t lookup[256];
+            static float last_sc = -1.0f;
+            static int last_zp = -9999;
+            
+            // Rebuild LUT only if params change (or first run)
+            if (sc != last_sc || zp != last_zp) {
+                for (int i = 0; i < 256; ++i) {
+                    float v = i / 255.f;
+                    int32_t q = (int32_t)(v / sc) + zp;
+                    if (q < -128) q = -128;
+                    if (q > 127) q = 127;
+                    lookup[i] = (int8_t)q;
+                }
+                last_sc = sc;
+                last_zp = zp;
+            }
+
             for (int i = 0; i < h * w * c; ++i) {
-                float v = rgb[i] / 255.f; int32_t q = (int32_t)(v / sc) + zp; if (q < -128) q = -128; if (q > 127) q = 127; dst[i] = (int8_t)q; }
+                dst[i] = lookup[rgb[i]];
+            }
             break;
         }
         case kTfLiteUInt8: {
@@ -375,26 +445,13 @@ static void core1_entry() {
     resolver.AddQuantize(); resolver.AddDequantize(); resolver.AddPad(); resolver.AddConcatenation();
     resolver.AddRelu6(); resolver.AddLogistic();
 
-    // IMPORTANT: For arena usage measurement we must pattern fill the arena
-    // BEFORE constructing the MicroInterpreter. Its constructor places internal
-    // allocator/graph planner objects inside the arena. Previously we filled
-    // after construction which overwrote those objects and caused AllocateTensors()
-    // to hang, leading to the core0 init timeout you observed.
-#if APP_ARENA_MEASURE
-    memset((void*)s_tensor_arena, 0xCD, kTensorArenaSize); // fill with canary pattern
-#endif
     static tflite::MicroInterpreter static_interpreter(s_model, resolver, s_tensor_arena, kTensorArenaSize, s_reporter);
     s_interpreter = &static_interpreter;
     if (s_interpreter->AllocateTensors() != kTfLiteOk) { printf("[ML] AllocateTensors failed\n"); uint32_t e = CMD_ERROR; queue_try_add(&q_core1_to_core0, &e); return; }
-#if APP_ARENA_MEASURE
-    // Scan from end backward for first non-pattern byte.
-    int used = 0;
-    for (int i = (int)kTensorArenaSize - 1; i >= 0; --i) {
-        if (s_tensor_arena[i] != (uint8_t)0xCD) { used = i + 1; break; }
-    }
-    printf("[ML] Arena used ≈ %d bytes (of %u)\n", used, (unsigned)kTensorArenaSize);
-    printf("[ML] Suggest new arena: %d KB (used + 8KB margin)\n", (used + 8192 + 1023)/1024);
-#endif
+    
+    // Print actual arena usage to help optimize kTensorArenaSize
+    printf("[ML] Arena used: %u bytes\n", s_interpreter->arena_used_bytes());
+
     s_input  = s_interpreter->input(0);
     s_output = s_interpreter->output(0);
     if (!s_input || !s_output) { printf("[ML] Missing tensors\n"); uint32_t e = CMD_ERROR; queue_try_add(&q_core1_to_core0, &e); return; }
@@ -424,13 +481,6 @@ static void core1_entry() {
                 save = spin_lock_blocking(g_spinlock);
                 InferenceResult* r = (InferenceResult*)&g_shared_result;
                 r->inference_time_ms = elapsed;
-#if APP_ENABLE_TIMING
-                // accumulate decode/resize + invoke inside core1 to avoid sync overhead
-                g_timing.decode_ms += g_last_decode_ms;
-                g_timing.resize_ms += g_last_resize_ms;
-                g_timing.invoke_ms += elapsed;
-                // capture_ms added on core0 after capture
-#endif
                 postprocess_output(s_output, r);
                 spin_unlock(g_spinlock, save);
 
@@ -450,6 +500,18 @@ int main() {
     if (!init_camera())   { printf("[APP] Camera init failed\n"); while (true) sleep_ms(1000); }
     print_free_ram();
 
+#ifdef APP_OLED_ENABLE
+    // Try init OLED on i2c1: SDA=6, SCL=7 (adjust wiring accordingly)
+    if (g_oled.init(i2c1, 6, 7)) {
+        g_oled.clear();
+        g_oled.drawText(0,0,"TFMicro Ready");
+        g_oled.drawText(0,8,"Init...");
+        g_oled.flush();
+    } else {
+        printf("[OLED] init failed\n");
+    }
+#endif
+
     multicore_launch_core1(core1_entry);
     printf("[APP] Waiting for model init...\n");
     absolute_time_t init_to = make_timeout_time_ms(kInitTimeoutMs);
@@ -463,11 +525,33 @@ int main() {
     printf("[APP] Model ready. Entering loop...\n");
 
     while (true) {
-    uint32_t cap_ms = 0;
-    if (!capture_jpeg(&cap_ms)) { sleep_ms(500); continue; }
-#if APP_ENABLE_TIMING
-    g_timing.capture_ms += cap_ms;
+    // Handle simple console commands (non-blocking). Press 'o' to toggle OLED power.
+#ifdef APP_OLED_ENABLE
+    int ch = getchar_timeout_us(0);
+    if (ch == 'o' || ch == 'O') {
+        if (g_oled.isPowered()) {
+            g_oled.power(false);
+            printf("[OLED] OFF\n");
+        } else {
+            g_oled.power(true);
+            printf("[OLED] ON\n");
+        }
+    }
 #endif
+    // Optional gating: wait here while PIN17 is LOW (no captures). If high continuously, run continuously.
+#if APP_GATE_BY_PIN17
+    if (g_pin17_level == 0) {
+        static bool announced = false;
+        if (!announced) { printf("[GATE] Waiting for PIN17 HIGH to start capture...\n"); announced = true; }
+        // Drain and print any pin edge events while waiting
+        PinEvent gev; while (pin_event_buffer_pop(&gev)) {
+            printf("[PIN17] %s\n", gev.level ? "HIGH" : "LOW");
+            if (gev.level) { announced = false; } // will exit gating loop after while condition re-check
+        }
+        if (g_pin17_level == 0) { sleep_ms(20); continue; }
+    }
+#endif
+    if (!capture_jpeg()) { sleep_ms(500); continue; }
         uint32_t save = spin_lock_blocking(g_spinlock);
         spin_unlock(g_spinlock, save);
         uint32_t c = CMD_PROCESS_IMAGE; queue_try_add(&q_core0_to_core1, &c);
@@ -476,6 +560,12 @@ int main() {
         while (!done && !err) {
             if (queue_try_remove(&q_core1_to_core0, &resp)) { if (resp == CMD_DONE) done = true; else if (resp == CMD_ERROR) err = true; }
             if (absolute_time_diff_us(get_absolute_time(), to) <= 0) { printf("[APP] Inference timeout\n"); err = true; }
+            // Drain any pin events captured by IRQ
+            PinEvent ev; bool printed_initial = false;
+            while (pin_event_buffer_pop(&ev)) {
+                printf("[PIN17] %s\n", ev.level ? "HIGH" : "LOW");
+                printed_initial = true; (void)printed_initial; // (kept if we later add conditional logic)
+            }
             sleep_ms(8);
         }
         if (!err) {
@@ -486,14 +576,45 @@ int main() {
             for (int i = 0; i < kNumClasses; ++i) { local.scores[i] = g_shared_result.scores[i]; local.predictions[i] = g_shared_result.predictions[i]; }
             spin_unlock(g_spinlock, save);
             print_result(local);
-#if APP_ENABLE_TIMING
-            g_timing.frames++;
-            if (g_timing.frames % 8 == 0) { g_timing.print_and_reset(); }
+#ifdef APP_OLED_ENABLE
+            if (local.valid && g_oled.isPowered()) {
+                g_oled.clear();
+                
+                // Left Column: List classes (Rows 0-2, skip 'none')
+                for (int i = 0; i < kNumClasses - 1; ++i) {
+                    char buf[20];
+                    snprintf(buf, sizeof(buf), "%s:%d%%", kClassNames[i], (int)(local.scores[i] * 100));
+                    g_oled.drawText(0, i * 8, buf);
+                }
+
+                // Right Column: Info (x=76)
+                // Row 0: Time
+                char tbuf[16];
+                snprintf(tbuf, sizeof(tbuf), "%lums", (unsigned long)local.inference_time_ms);
+                g_oled.drawText(76, 0, tbuf);
+
+                // Row 1: Status
+                const char* status = "FREE";
+#if APP_GATE_BY_PIN17
+                status = g_pin17_level ? "RUN" : "WAIT";
+#endif
+                g_oled.drawText(76, 8, status);
+
+                // Row 3: Branding (Bottom Right)
+                g_oled.drawText(44, 24, "BSB-PicoVision");
+
+                g_oled.flush();
+            }
 #endif
         } else {
             printf("[APP] Inference error, retrying...\n");
         }
-        sleep_ms(kLoopDelayMs);
+        // Post-frame gating: if pin went LOW during processing, pause immediately
+#if APP_GATE_BY_PIN17
+        if (g_pin17_level == 0) {
+            continue; // loop top will block until HIGH again
+        }
+#endif
     }
     return 0;
 }
