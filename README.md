@@ -1,6 +1,5 @@
 # Ultra Low Power Computer Vision for Social Robots
-
-**Efficient Person & Pet Detection on RP2040 using TensorFlow Lite Micro**
+![PXL_20251201_002126755 RAW-01 MP COVER](https://github.com/user-attachments/assets/164d97c0-040b-4f30-93dc-a08067cfdc1e)
 
 This project implements a vision subsystem for a mobile social robot, designed to identify interaction targets (Person, Dog, Cat) while maximizing battery life. It utilizes a Hardware-Software Co-Design approach, optimizing both the neural network architecture and dual-core firmware logic on the RP2040 microcontroller.
 
