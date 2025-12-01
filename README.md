@@ -142,7 +142,3 @@ The firmware utilizes the RP2040's dual cores to separate concerns and leverages
         python Youtube.py "https://www.youtube.com/watch?v=VIDEO_ID"
         ```
 
-## 🔮 Future Work
-**Brady Barlow**
-*Project Date: December 2, 2025*
-
