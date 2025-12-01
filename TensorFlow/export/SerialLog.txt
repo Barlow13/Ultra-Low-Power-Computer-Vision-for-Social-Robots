@@ -1,0 +1,121 @@
+---- Reopened serial port COM7 ----
+[CAM] Ready
+Free RAM (approx): 49000 bytes
+[APP] Waiting for model init...
+[ML] Core1 starting...
+[ML] Arena used: 153876 bytes
+[ML] Model loaded (128736 bytes) input=96x96x3 type=9 output_type=9
+[APP] Model ready. Entering loop...
+[CAM] Captured 2088 bytes
+
+--- Inference (889 ms) ---
+  person: 0.383
+  dog: 0.289
+  cat: 0.305
+  none: 0.383 *
+---------------------------
+[CAM] Captured 2088 bytes
+
+--- Inference (889 ms) ---
+  person: 0.398
+  dog: 0.305 *
+  cat: 0.305
+  none: 0.383 *
+---------------------------
+[CAM] Captured 2088 bytes
+
+--- Inference (889 ms) ---
+  person: 0.398
+  dog: 0.305 *
+  cat: 0.320
+  none: 0.383 *
+---------------------------
+[CAM] Captured 2088 bytes
+
+--- Inference (889 ms) ---
+  person: 0.383
+  dog: 0.289
+  cat: 0.305
+  none: 0.383 *
+---------------------------
+[CAM] Captured 2088 bytes
+
+--- Inference (889 ms) ---
+  person: 0.367
+  dog: 0.289
+  cat: 0.305
+  none: 0.398 *
+---------------------------
+[CAM] Captured 2088 bytes
+
+--- Inference (889 ms) ---
+  person: 0.398
+  dog: 0.305 *
+  cat: 0.305
+  none: 0.383 *
+---------------------------
+[CAM] Captured 2088 bytes
+
+--- Inference (889 ms) ---
+  person: 0.383
+  dog: 0.289
+  cat: 0.305
+  none: 0.383 *
+---------------------------
+[CAM] Captured 2088 bytes
+
+--- Inference (889 ms) ---
+  person: 0.398
+  dog: 0.289
+  cat: 0.305
+  none: 0.383 *
+---------------------------
+[CAM] Captured 2088 bytes
+
+--- Inference (889 ms) ---
+  person: 0.398
+  dog: 0.305 *
+  cat: 0.305
+  none: 0.383 *
+---------------------------
+[CAM] Captured 2088 bytes
+[PIN17] LOW
+
+--- Inference (889 ms) ---
+  person: 0.367
+  dog: 0.289
+  cat: 0.305
+  none: 0.398 *
+---------------------------
+[GATE] Waiting for PIN17 HIGH to start capture...
+[CAM] Captured 2088 bytes
+[PIN17] HIGH
+
+--- Inference (889 ms) ---
+  person: 0.383
+  dog: 0.305 *
+  cat: 0.320
+  none: 0.383 *
+---------------------------
+[CAM] Captured 2088 bytes
+
+--- Inference (889 ms) ---
+  person: 0.383
+  dog: 0.305 *
+  cat: 0.305
+  none: 0.383 *
+---------------------------
+[CAM] Captured 2088 bytes
+[PIN17] LOW
+
+--- Inference (889 ms) ---
+  person: 0.367
+  dog: 0.289
+  cat: 0.305
+  none: 0.398 *
+---------------------------
+---- Sent utf8 encoded message: "o" ----
+[OLED] OFF
+---- Sent utf8 encoded message: "o" ----
+[OLED] ON
+---- Closed the serial port COM7 ----
